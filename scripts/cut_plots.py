@@ -9,10 +9,10 @@ import configparser
 logging.basicConfig(level=logging.INFO, filename = "utils.log" ,format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("Cut_Plots")
 
-def crop_plots_from_vrt(vrt_path, plot_shapefile_path, output_dir, id_column="plot_id"):
+def crop_plots_from_vrt(vrt_path, plot_shapefile_path, output_dir, id_column="plot_id", split_column="class"):
     """
-    Crops plot polygons from a 5-channel VRT raster and saves them 
-    as individual 5-channel GeoTIFFs.
+    Crops plot polygons from a VRT raster and saves them as individual
+    GeoTIFFs under train/test subdirectories selected by split_column.
     """
     os.makedirs(output_dir, exist_ok=True)
     
@@ -33,6 +33,15 @@ def crop_plots_from_vrt(vrt_path, plot_shapefile_path, output_dir, id_column="pl
         # 3. Process plot by plot
         for idx, row in plots_gdf.iterrows():
             geom = [row.geometry.__geo_interface__]
+
+            split = str(row.get(split_column, "")).strip().lower()
+            if split not in {"train", "test"}:
+                raise ValueError(
+                    f"Plot at row {idx} has unsupported {split_column!r} value: {row.get(split_column)!r}. "
+                    "Expected 'train' or 'test'."
+                )
+            split_dir = os.path.join(output_dir, split)
+            os.makedirs(split_dir, exist_ok=True)
             
             # Get plot ID for output naming
             plot_id = row[id_column] if id_column in row and row[id_column] else f"plot_{idx}"
@@ -59,11 +68,11 @@ def crop_plots_from_vrt(vrt_path, plot_shapefile_path, output_dir, id_column="pl
                 })
 
                 # Write out 5-channel plot GeoTIFF
-                output_plot_path = os.path.join(output_dir, f"plot_{plot_id}.tif")
+                output_plot_path = os.path.join(split_dir, f"plot_{plot_id}.tif")
                 with rasterio.open(output_plot_path, "w", **out_meta) as dst:
                     dst.write(out_image.astype('float32'))
 
-                logger.info(f"Saved: plot_{plot_id}.tif | Size: {out_image.shape[2]}x{out_image.shape[1]} px")
+                logger.info(f"Saved: {split}/{os.path.basename(output_plot_path)} | Size: {out_image.shape[2]}x{out_image.shape[1]} px")
 
             except ValueError as e:
                 # Skips if plot geometry falls outside the raster bounds
@@ -96,5 +105,6 @@ if __name__ == "__main__":
         vrt_path=VRT_FILE,
         plot_shapefile_path=PLOT_SHAPEFILE,
         output_dir=OUTPUT_FOLDER,
-        id_column="plot_id"  # Attribute column used to name files (e.g. plot_1.tif)
+        id_column="plot_id",  # Attribute column used to name files (e.g. plot_1.tif)
+        split_column="class"   # Attribute column used to select train/test output folder
     )

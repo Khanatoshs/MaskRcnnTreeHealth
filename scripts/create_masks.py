@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO, filename = "utils.log" ,format='%(asctim
 logger = logging.getLogger("Create_Masks")
 
 config = configparser.ConfigParser()
-config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
+config_path = "config.ini"
 config.read(config_path)
 
 

@@ -470,6 +470,9 @@ def main(config):
     learning_rate = float(config.get("TRAIN", "learning_rate", fallback="1e-4"))
     weight_decay = float(config.get("TRAIN", "weight_decay", fallback="1e-4"))
     num_epochs = int(config.get("TRAIN", "num_epochs", fallback="10"))
+    early_stopping_patience = int(config.get("TRAIN", "early_stopping_patience", fallback="30"))
+    if early_stopping_patience < 1:
+        raise ValueError("early_stopping_patience must be at least 1")
     iou_threshold = float(config.get("TRAIN", "iou_threshold", fallback="0.5"))
     checkpoint_dir = config.get("TRAIN", "checkpoint_dir", fallback="checkpoints")
     metrics_dir = config.get("TRAIN", "metrics_dir", fallback=os.path.join(checkpoint_dir, "metrics"))
@@ -483,7 +486,8 @@ def main(config):
     use_amp = config.getboolean("TRAIN", "amp", fallback=False)
     scaler = torch.amp.GradScaler() if use_amp and device.type == 'cuda' else None
 
-    best_val = float('inf')
+    best_monitor = None
+    epochs_without_improvement = 0
     save_best_only = config.getboolean("TRAIN", "save_best_only", fallback=False)
     metrics_history = []
 
@@ -577,6 +581,27 @@ def main(config):
         for key, values in epoch_class_pr.items():
             epoch_summary[key] = float(np.mean(values)) if values else 0.0
 
+        if np.isfinite(val_loss):
+            monitor_name = "val_loss"
+            monitor_value = val_loss
+            improved = best_monitor is None or monitor_value < best_monitor
+        else:
+            f1_values = [value for key, value in epoch_summary.items() if key.endswith("_f1")]
+            monitor_name = "mean_f1"
+            monitor_value = float(np.mean(f1_values)) if f1_values else 0.0
+            improved = best_monitor is None or monitor_value > best_monitor
+
+        if improved:
+            best_monitor = monitor_value
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+        logger.info(
+            f"Epoch [{epoch + 1}/{num_epochs}] Early stopping monitor: "
+            f"{monitor_name}={monitor_value:.6f}, "
+            f"no improvement for {epochs_without_improvement}/{early_stopping_patience} epochs"
+        )
+
         metrics_history.append(epoch_summary)
         save_confusion_matrix(epoch_confusion, os.path.join(metrics_dir, f"confusion_matrix_epoch_{epoch + 1}.csv"))
         save_metrics_history_csv(metrics_history, os.path.join(metrics_dir, "metrics_history.csv"))
@@ -590,8 +615,7 @@ def main(config):
         # Save checkpoint (best or every epoch)
         checkpoint_path = os.path.join(checkpoint_dir, f"maskrcnn_epoch_{epoch + 1}.pth")
         if save_best_only:
-            if val_loss < best_val:
-                best_val = val_loss
+            if improved:
                 torch.save({
                     'epoch': epoch + 1,
                     'model_state_dict': model.state_dict(),
@@ -613,6 +637,13 @@ def main(config):
                 'weight_decay': weight_decay,
             }, checkpoint_path)
             logger.info(f"Saved checkpoint to: {checkpoint_path}")
+
+        if epochs_without_improvement >= early_stopping_patience:
+            logger.info(
+                f"Early stopping triggered after epoch {epoch + 1}: "
+                f"no improvement for {early_stopping_patience} consecutive epochs."
+            )
+            break
 
         if torch.cuda.is_available() and config.get("TRAIN", "device", fallback="cuda") == "cuda":
             torch.cuda.empty_cache()

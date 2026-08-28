@@ -14,7 +14,7 @@ class StackedImageInstanceMaskDataset(Dataset):
       - target: dict with 'boxes' (FloatTensor [N,4]), 'labels' (Int64Tensor [N]),
                 'masks' (UInt8Tensor [N,H,W]), 'image_id' (Int64Tensor [1])
     """
-    def __init__(self, image_paths, mask_paths, transforms=None, image_norm=True, drop_alpha=True):
+    def __init__(self, image_paths, mask_paths, transforms=None, image_norm=True, drop_alpha=False):
         assert len(image_paths) == len(mask_paths)
         self.image_paths = image_paths
         self.mask_paths = mask_paths
@@ -30,16 +30,14 @@ class StackedImageInstanceMaskDataset(Dataset):
         with rasterio.open(self.image_paths[idx]) as src:
             img = src.read().astype(np.float32)  # shape: [C, H, W]
 
-        # Optionally drop the 4th channel (alpha) if present
+        # Optionally drop an alpha band only when the user explicitly requests it.
+        # For multi-band remote sensing data it is safer to preserve all bands by default.
         if self.drop_alpha and img.shape[0] >= 4:
-            # Remove band index 3 (0-based)
             img = np.delete(img, 3, axis=0)
         if self.image_norm:
-            # If first 3 bands are RGB uint8, scale them; otherwise assume float32 already
+            # Normalize first 3 bands if they look like uint8 RGB imagery.
             if img.dtype == np.float32:
-                # Try a heuristic: if max>1 and <=255 likely needs /255 for first 3 bands
                 if img.max() > 1.0 and img.max() <= 255.0:
-                    # scale only first 3 channels if present
                     if img.shape[0] >= 3:
                         img[:3] = img[:3] / 255.0
                     else:

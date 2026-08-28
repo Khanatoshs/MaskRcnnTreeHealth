@@ -31,17 +31,18 @@ logging.basicConfig(level=logging.INFO, filename = "train.log" ,format='%(asctim
 logger = logging.getLogger("Train_MaskRCNN")
 
 # =====================================================================
-# 1. 5-CHANNEL MASK R-CNN MODEL BUILDER
+# 1. DYNAMIC CHANNEL MASK R-CNN MODEL BUILDER
 # =====================================================================
 
-def get_5channel_maskrcnn(num_classes):
+def get_multiband_maskrcnn(num_classes, in_channels=5):
+    """Build a Mask R-CNN model for arbitrary input channel counts.
+
+    The first three channels are treated as RGB-style bands; additional channels
+    are initialized from the mean RGB kernel weights to keep transfer learning
+    stable for NDVI/CHM or other remote-sensing features.
     """
-    Builds a Mask R-CNN model adapted for 5-channel inputs:
-    Channels 0-2: RGB
-    Channel 3: NDVI
-    Channel 4: CHM
-    """
-    in_channels = 5
+    if in_channels < 1:
+        raise ValueError(f"in_channels must be positive, got {in_channels}")
 
     # 1. Load a pre-trained ResNet-50 FPN backbone
     backbone = resnet_fpn_backbone(
@@ -50,37 +51,36 @@ def get_5channel_maskrcnn(num_classes):
         trainable_layers=3
     )
 
-    # 2. Modify the first Conv2d layer (conv1) to take 5 channels instead of 3
+    # 2. Modify the first Conv2d layer to accept the configured number of channels.
     old_conv = backbone.body.conv1
     new_conv = nn.Conv2d(
-        in_channels=in_channels,  # [R, G, B, NDVI, CHM]
+        in_channels=in_channels,
         out_channels=old_conv.out_channels,
         kernel_size=old_conv.kernel_size,
         stride=old_conv.stride,
         padding=old_conv.padding,
-        bias=old_conv.bias
+        bias=old_conv.bias is not None,
     )
 
-    # 3. Transfer pre-trained weights & warm-start NDVI/CHM channels
+    # 3. Transfer pre-trained weights and initialize extra bands from RGB statistics.
     with torch.no_grad():
-        # Copy RGB weights directly
-        new_conv.weight.data[:, :3, :, :].copy_(old_conv.weight.data[:, :3, :, :])
-        # Initialize NDVI and CHM channels with the mean of RGB weights
-        mean_rgb_weight = old_conv.weight.data.mean(dim=1, keepdim=True)
-        new_conv.weight.data[:, 3:, :, :].copy_(mean_rgb_weight.repeat(1, in_channels - 3, 1, 1))
-        # Copy bias if present
+        if in_channels >= 3:
+            new_conv.weight.data[:, :3, :, :].copy_(old_conv.weight.data[:, :3, :, :])
+        if in_channels > 3:
+            mean_rgb_weight = old_conv.weight.data.mean(dim=1, keepdim=True)
+            new_conv.weight.data[:, 3:, :, :].copy_(mean_rgb_weight.repeat(1, in_channels - 3, 1, 1))
         if old_conv.bias is not None and new_conv.bias is not None:
             new_conv.bias.data.copy_(old_conv.bias.data)
 
     backbone.body.conv1 = new_conv
 
     # 4. Match torchvision's image normalization to the actual input channel count.
-    # The default transform uses RGB stats for 3 channels, which crashes when the
-    # input tensor is 5-channel (RGB + NDVI + CHM).
-    image_mean = [0.485, 0.456, 0.406] + [0.5] * (in_channels - 3)
-    image_std = [0.229, 0.224, 0.225] + [0.5] * (in_channels - 3)
+    image_mean = [0.485, 0.456, 0.406] + [0.5] * max(0, in_channels - 3)
+    image_std = [0.229, 0.224, 0.225] + [0.5] * max(0, in_channels - 3)
+    image_mean = image_mean[:in_channels]
+    image_std = image_std[:in_channels]
 
-    # 5. Initialize Mask R-CNN with modified backbone and custom per-channel normalization
+    # 5. Initialize Mask R-CNN with modified backbone and custom per-channel normalization.
     model = MaskRCNN(
         backbone,
         num_classes=num_classes,
@@ -88,11 +88,11 @@ def get_5channel_maskrcnn(num_classes):
         image_std=image_std,
     )
 
-    # 5. Replace Box Predictor Head for custom class count
+    # 6. Replace Box Predictor Head for custom class count.
     in_features_box = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features_box, num_classes)
 
-    # 6. Replace Mask Predictor Head for custom class count
+    # 7. Replace Mask Predictor Head for custom class count.
     in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
     hidden_layer = 256
     model.roi_heads.mask_predictor = MaskRCNNPredictor(
@@ -100,6 +100,11 @@ def get_5channel_maskrcnn(num_classes):
     )
 
     return model
+
+
+def get_5channel_maskrcnn(num_classes):
+    """Backward-compatible wrapper for the original 5-channel configuration."""
+    return get_multiband_maskrcnn(num_classes=num_classes, in_channels=5)
 
 
 def collate_fn(batch):
@@ -406,9 +411,12 @@ def main(config):
 
     # Set up class counts (Background=0, Tree=1)
     NUM_CLASSES = int(config.get("TRAIN", "num_classes", fallback="2"))
+    NUM_INPUT_CHANNELS = int(config.get("TRAIN", "num_input_channels", fallback="5"))
+
+    logger.info(f"Input channels: {NUM_INPUT_CHANNELS} | Classes: {NUM_CLASSES}")
 
     # Initialize Model
-    model = get_5channel_maskrcnn(num_classes=NUM_CLASSES)
+    model = get_multiband_maskrcnn(num_classes=NUM_CLASSES, in_channels=NUM_INPUT_CHANNELS)
     # Move model to device after construction
     model.to(device)
 

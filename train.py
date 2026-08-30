@@ -1,5 +1,6 @@
 import gc
 import os
+import re
 import configparser
 import torch
 import torch.nn as nn
@@ -16,19 +17,22 @@ from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
 import torchvision
 from torchvision.models.detection import MaskRCNN
+from torchvision.models.detection.anchor_utils import AnchorGenerator
 from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 # Prefer a dataset that reads stacked multi-channel images and instance-mask TIFFs
 try:
     from dataset.multi_channel_dataset import StackedImageInstanceMaskDataset as StackedDataset
+    from dataset.multi_channel_dataset import TrainAugmentation
 except Exception:
     # Fallback to the original UAV5ChannelDataset if a stacked dataset is not available
     from dataset.multi_channel_dataset import UAV5ChannelDataset as StackedDataset
+    TrainAugmentation = None
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-logging.basicConfig(level=logging.INFO, filename = "train.log" ,format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, filename = "train_20260830.log" ,format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Note: For debugging CUDA errors, run training with:
@@ -40,12 +44,39 @@ logger = logging.getLogger("Train_MaskRCNN")
 # 1. DYNAMIC CHANNEL MASK R-CNN MODEL BUILDER
 # =====================================================================
 
-def get_multiband_maskrcnn(num_classes, in_channels=5):
+def get_multiband_maskrcnn(num_classes, in_channels=5, anchor_sizes=None, anchor_aspect_ratios=None,
+                           image_mean=None, image_std=None, extra_channel_scale=None):
     """Build a Mask R-CNN model for arbitrary input channel counts.
 
-    The first three channels are treated as RGB-style bands; additional channels
-    are initialized from the mean RGB kernel weights to keep transfer learning
-    stable for NDVI/CHM or other remote-sensing features.
+    The first three channels keep the pretrained RGB kernels untouched; additional
+    channels are initialized from the mean of those kernels, scaled so conv1's
+    output stays in the range the frozen BatchNorm layers were calibrated for.
+
+    extra_channel_scale: multiplier on the mean-RGB kernel used to seed each extra
+        band. Defaults to 1/(in_channels - 3) - see the comment at the assignment
+        for why the scale matters and what an unscaled copy costs.
+
+    anchor_sizes: anchors per FPN level (5 levels for a resnet50_fpn backbone).
+        Either a flat list - one size per level, e.g. [32, 64, 128, 256, 512] - or a
+        list of lists giving several sizes per level, e.g.
+        [[32,40,51], [64,81,102], ...]. Defaults to torchvision's stock pyramid.
+        **Sizes must grow with the level's stride** (strides are 4, 8, 16, 32, 64).
+        A compressed range spread across all five levels puts large anchors on the
+        stride-4 map, where they vastly outnumber every other level's and swamp the
+        RPN's 256-anchor sample with the level least able to localize a big object.
+        See scripts/compute_anchor_sizes.py.
+    anchor_aspect_ratios: aspect ratios shared across all levels, e.g. (0.5, 1.0, 2.0).
+    image_mean/image_std: per-channel input normalization, one value per channel.
+        **Keep ImageNet values (0.485/0.456/0.406, 0.229/0.224/0.225) for the first
+        three channels.** The backbone's FrozenBatchNorm2d layers carry running
+        statistics from ImageNet pretraining and cannot adapt, so rescaling RGB
+        mis-calibrates all 53 of them and collapses training.
+        **Pass measured statistics for the extra bands whenever they are not in
+        [0, 1].** The fallback below uses 0.5/0.5 for every extra channel, which
+        assumes a [0, 1] range - true for vegetation indices, false for CHM
+        (metres): with the fallback CHM spans ~58 normalized units while NDRE spans
+        ~1, so the height band dominates the first conv layer. Derive the extra-band
+        values with scripts/compute_channel_stats.py.
     """
     if in_channels < 1:
         raise ValueError(f"in_channels must be positive, got {in_channels}")
@@ -69,36 +100,87 @@ def get_multiband_maskrcnn(num_classes, in_channels=5):
     )
 
     # 3. Transfer pre-trained weights and initialize extra bands from RGB statistics.
+    #
+    # The extra channels are seeded with the mean of the pretrained RGB kernels -
+    # the only sensible prior, since nothing in ImageNet corresponds to CHM or a
+    # vegetation index. They are then scaled by 1/(extra channels).
+    #
+    # The scale is not cosmetic. conv1 feeds bn1, and every norm layer in this
+    # backbone is FrozenBatchNorm2d: ImageNet running statistics, requires_grad
+    # False, so it cannot rescale its input. Giving each extra band a full-strength
+    # mean kernel adds one more RGB-sized response per band, which measured 1.82x
+    # the conv1 output std the frozen bn1 was calibrated for on this 8-channel data
+    # - a shift every downstream block then inherits. Scaling by 1/(in_channels-3)
+    # makes the extra bands contribute about one mean-RGB kernel's response in
+    # total, i.e. as if a single colour channel had been added, which measured
+    # 0.98x the pretrained std.
+    n_extra = max(0, in_channels - 3)
+    if extra_channel_scale is None:
+        extra_channel_scale = 1.0 / n_extra if n_extra else 0.0
+
     with torch.no_grad():
         if in_channels >= 3:
             new_conv.weight.data[:, :3, :, :].copy_(old_conv.weight.data[:, :3, :, :])
-        if in_channels > 3:
+        elif in_channels > 0:
+            # Fewer than three input channels: keep the leading pretrained kernels.
+            new_conv.weight.data.copy_(old_conv.weight.data[:, :in_channels, :, :])
+        if n_extra:
             mean_rgb_weight = old_conv.weight.data.mean(dim=1, keepdim=True)
-            new_conv.weight.data[:, 3:, :, :].copy_(mean_rgb_weight.repeat(1, in_channels - 3, 1, 1))
+            new_conv.weight.data[:, 3:, :, :].copy_(
+                mean_rgb_weight.repeat(1, n_extra, 1, 1) * extra_channel_scale
+            )
         if old_conv.bias is not None and new_conv.bias is not None:
             new_conv.bias.data.copy_(old_conv.bias.data)
 
     backbone.body.conv1 = new_conv
 
     # 4. Match torchvision's image normalization to the actual input channel count.
-    image_mean = [0.485, 0.456, 0.406] + [0.5] * max(0, in_channels - 3)
-    image_std = [0.229, 0.224, 0.225] + [0.5] * max(0, in_channels - 3)
-    image_mean = image_mean[:in_channels]
-    image_std = image_std[:in_channels]
+    # Prefer measured per-channel statistics; the 0.5 fallback is only correct for
+    # channels that already live in [0, 1] (see the docstring).
+    if image_mean is None:
+        image_mean = [0.485, 0.456, 0.406] + [0.5] * max(0, in_channels - 3)
+    if image_std is None:
+        image_std = [0.229, 0.224, 0.225] + [0.5] * max(0, in_channels - 3)
+    image_mean = list(image_mean)[:in_channels]
+    image_std = list(image_std)[:in_channels]
+    if len(image_mean) != in_channels or len(image_std) != in_channels:
+        raise ValueError(
+            f"image_mean/image_std must have one value per channel "
+            f"(got {len(image_mean)}/{len(image_std)} for in_channels={in_channels})"
+        )
+    if any(s <= 0 for s in image_std):
+        raise ValueError(f"image_std values must be positive, got {image_std}")
 
-    # 5. Initialize Mask R-CNN with modified backbone and custom per-channel normalization.
+    # 5. Build an RPN anchor generator matched to the actual crown size distribution
+    # instead of torchvision's generic (32, 64, 128, 256, 512) defaults.
+    rpn_anchor_generator = None
+    if anchor_sizes is not None:
+        aspect_ratios = tuple(anchor_aspect_ratios) if anchor_aspect_ratios else (0.5, 1.0, 2.0)
+        # Accept both a flat "one size per level" list and a nested
+        # "several sizes per level" list.
+        levels = tuple(
+            tuple(s) if isinstance(s, (list, tuple)) else (s,)
+            for s in anchor_sizes
+        )
+        rpn_anchor_generator = AnchorGenerator(
+            sizes=levels,
+            aspect_ratios=(aspect_ratios,) * len(levels),
+        )
+
+    # 6. Initialize Mask R-CNN with modified backbone and custom per-channel normalization.
     model = MaskRCNN(
         backbone,
         num_classes=num_classes,
         image_mean=image_mean,
         image_std=image_std,
+        rpn_anchor_generator=rpn_anchor_generator,
     )
 
-    # 6. Replace Box Predictor Head for custom class count.
+    # 7. Replace Box Predictor Head for custom class count.
     in_features_box = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features_box, num_classes)
 
-    # 7. Replace Mask Predictor Head for custom class count.
+    # 8. Replace Mask Predictor Head for custom class count.
     in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
     hidden_layer = 256
     model.roi_heads.mask_predictor = MaskRCNNPredictor(
@@ -115,6 +197,68 @@ def get_5channel_maskrcnn(num_classes):
 
 def collate_fn(batch):
     return tuple(zip(*batch))
+
+
+def plot_id_from_tile_path(path):
+    """Recover the source plot name from a sliced tile filename.
+
+    slice_plots.py names tiles '{plot}_tile_y{y}_x{x}.tif', so everything before
+    '_tile_y' identifies the plot the tile was cut from.
+    """
+    name = os.path.basename(path)
+    match = re.match(r"(.+)_tile_y\d+_x\d+\.tif$", name)
+    return match.group(1) if match else None
+
+
+def split_paths_by_plot(image_paths, mask_paths, train_size=0.8, random_state=42, logger_obj=None):
+    """Split tiles into train/val by *plot*, so no plot appears on both sides.
+
+    A random tile-level split leaks badly here: slice_plots.py cuts tiles with
+    overlap, so neighbouring tiles share pixels and trees. Splitting whole plots
+    keeps the validation set genuinely unseen.
+
+    Falls back to a plain tile-level split if tile names can't be parsed.
+    """
+    log = logger_obj.info if logger_obj else (lambda *_: None)
+
+    plots = [plot_id_from_tile_path(p) for p in image_paths]
+    if any(p is None for p in plots):
+        if logger_obj:
+            logger_obj.warning(
+                "Could not parse plot IDs from tile filenames; falling back to a "
+                "tile-level split (validation metrics may be optimistic)."
+            )
+        return train_test_split(image_paths, mask_paths, train_size=train_size, random_state=random_state)
+
+    unique_plots = sorted(set(plots))
+    if len(unique_plots) < 2:
+        if logger_obj:
+            logger_obj.warning(
+                f"Only {len(unique_plots)} plot(s) found; cannot split by plot. "
+                "Falling back to a tile-level split."
+            )
+        return train_test_split(image_paths, mask_paths, train_size=train_size, random_state=random_state)
+
+    train_plots, val_plots = train_test_split(
+        unique_plots, train_size=train_size, random_state=random_state
+    )
+    train_plots, val_plots = set(train_plots), set(val_plots)
+
+    train_images, train_masks, val_images, val_masks = [], [], [], []
+    for img, msk, plot in zip(image_paths, mask_paths, plots):
+        if plot in train_plots:
+            train_images.append(img)
+            train_masks.append(msk)
+        else:
+            val_images.append(img)
+            val_masks.append(msk)
+
+    log(
+        f"Plot-level split: {len(train_plots)} train plots / {len(val_plots)} val plots "
+        f"(no plot appears in both)"
+    )
+    log(f"  validation plots: {sorted(val_plots)}")
+    return train_images, val_images, train_masks, val_masks
 
 
 def flatten_metrics(metrics, prefix=""):
@@ -172,6 +316,11 @@ def compute_class_prf(predictions, targets, score_threshold=0.5, iou_threshold=0
         score_threshold: Minimum confidence score for predictions
         iou_threshold: Minimum IoU for matching predictions to targets
         num_classes: Number of classes (1 to num_classes). If None, only classes in batch are computed.
+
+    Classes absent from BOTH the ground truth and the predictions are omitted
+    from the result rather than scored 0.0 - see the comment at the skip below.
+    Callers must therefore treat a missing 'class_N' key as "not applicable to
+    this batch", not as a zero.
     """
     if predictions is None:
         predictions = []
@@ -191,7 +340,9 @@ def compute_class_prf(predictions, targets, score_threshold=0.5, iou_threshold=0
         all_classes.update(range(1, num_classes))
 
     if not all_classes:
-        return {"class_1": {"precision": 0.0, "recall": 0.0, "f1": 0.0}}
+        # Nothing in this batch to score at all - report no metrics rather than a
+        # fabricated zero for class 1.
+        return {}
 
     metrics = {}
     for cls_id in sorted(all_classes):
@@ -222,7 +373,14 @@ def compute_class_prf(predictions, targets, score_threshold=0.5, iou_threshold=0
                 pred_scores.extend(scores[mask].tolist())
 
         if len(pred_boxes) == 0 and len(gt_boxes) == 0:
-            precision = recall = f1 = 0.0
+            # Class absent from both ground truth and predictions in this batch:
+            # the model was correct to predict nothing, so there is nothing to
+            # score. Emitting 0.0 here and folding it into the macro mean badly
+            # understates precision/recall (with val_batch_size=1 most tiles hold
+            # only 2-3 of the 4 classes, so ~32% of scores were fake zeros).
+            # Omit the class entirely; callers then average only over classes
+            # that were actually present.
+            continue
         else:
             order = sorted(range(len(pred_boxes)), key=lambda idx: pred_scores[idx], reverse=True)
             gt_used = [False] * len(gt_boxes)
@@ -259,10 +417,14 @@ def compute_class_prf(predictions, targets, score_threshold=0.5, iou_threshold=0
 
 
 def compute_global_pr_metrics(predictions, targets, score_threshold=0.5, iou_threshold=0.5, num_classes=None):
-    """Compute macro mean precision and recall over all classes."""
+    """Compute macro mean precision and recall over the classes present in this batch.
+
+    Returns {} when no class was applicable, so callers can skip the batch instead
+    of averaging in a zero that no class actually earned.
+    """
     class_metrics = compute_class_prf(predictions, targets, score_threshold=score_threshold, iou_threshold=iou_threshold, num_classes=num_classes)
     if not class_metrics:
-        return {"mean_precision": 0.0, "mean_recall": 0.0}
+        return {}
 
     precisions = [v["precision"] for v in class_metrics.values()]
     recalls = [v["recall"] for v in class_metrics.values()]
@@ -347,15 +509,26 @@ def save_confusion_matrix(confusion_matrix, path):
     plt.close(fig)
 
 
-def save_final_metrics_summary(metrics_history, metrics_dir, logger_obj):
+def save_final_metrics_summary(metrics_history, metrics_dir, logger_obj, best_epoch=None):
     """
     Save a comprehensive final metrics summary to a text file and log it.
+
+    `best_epoch` must be the epoch number that was actually checkpointed
+    (i.e. the epoch that minimized val_loss during training). It is looked
+    up in `metrics_history` rather than recomputed here, so the reported
+    "best epoch" always matches the model weights saved to disk.
     """
     if not metrics_history:
         return
-    
+
     final_metrics = metrics_history[-1]
-    best_metrics = max(metrics_history, key=lambda x: x.get("mean_precision", 0))
+    if best_epoch is not None:
+        best_metrics = next((m for m in metrics_history if m["epoch"] == best_epoch), final_metrics)
+    else:
+        # Fallback for callers that don't track the checkpointed epoch: use the
+        # same criterion as checkpointing (lowest val_loss), not mean_precision,
+        # so this never disagrees with which weights were actually saved.
+        best_metrics = min(metrics_history, key=lambda x: x.get("val_loss", float("inf")))
     
     summary_path = os.path.join(metrics_dir, "final_metrics.txt")
     
@@ -580,8 +753,44 @@ def main(config):
 
     logger.info(f"Input channels: {NUM_INPUT_CHANNELS} | Classes: {NUM_CLASSES}")
 
+    # 'a,b,c' -> one size per FPN level; 'a,b;c,d;...' -> several sizes per level,
+    # semicolons separating the levels.
+    anchor_sizes_raw = config.get("TRAIN", "anchor_sizes", fallback="").strip()
+    if ";" in anchor_sizes_raw:
+        anchor_sizes = [[int(s) for s in level.split(",") if s.strip()]
+                        for level in anchor_sizes_raw.split(";") if level.strip()] or None
+    else:
+        anchor_sizes = [int(s) for s in anchor_sizes_raw.split(",") if s.strip()] or None
+    anchor_ratios_raw = config.get("TRAIN", "anchor_aspect_ratios", fallback="").strip()
+    anchor_aspect_ratios = [float(r) for r in anchor_ratios_raw.split(",") if r.strip()] or None
+    if anchor_sizes:
+        logger.info(f"Using data-derived anchor sizes: {anchor_sizes} | aspect ratios: {anchor_aspect_ratios}")
+
+    # Per-channel input normalization. Without these, extra bands fall back to
+    # 0.5/0.5, which is wrong for anything not already in [0, 1] (e.g. CHM in
+    # metres). See scripts/compute_channel_stats.py.
+    image_mean_raw = config.get("TRAIN", "image_mean", fallback="").strip()
+    image_mean = [float(v) for v in image_mean_raw.split(",") if v.strip()] or None
+    image_std_raw = config.get("TRAIN", "image_std", fallback="").strip()
+    image_std = [float(v) for v in image_std_raw.split(",") if v.strip()] or None
+    if image_mean and image_std:
+        logger.info(f"Using measured per-channel normalization | mean={image_mean} std={image_std}")
+    else:
+        logger.warning(
+            "No image_mean/image_std in config; falling back to 0.5/0.5 for non-RGB channels. "
+            "This is wrong for bands outside [0, 1] such as CHM - run "
+            "scripts/compute_channel_stats.py and set them in config.ini."
+        )
+
     # Initialize Model
-    model = get_multiband_maskrcnn(num_classes=NUM_CLASSES, in_channels=NUM_INPUT_CHANNELS)
+    model = get_multiband_maskrcnn(
+        num_classes=NUM_CLASSES,
+        in_channels=NUM_INPUT_CHANNELS,
+        anchor_sizes=anchor_sizes,
+        anchor_aspect_ratios=anchor_aspect_ratios,
+        image_mean=image_mean,
+        image_std=image_std,
+    )
     # Move model to device after construction
     model.to(device)
 
@@ -624,16 +833,29 @@ def main(config):
             # Get train/validation split ratio from config
             train_val_split = float(config.get("TRAIN", "train_val_split", fallback="0.8"))
             logger.info(f"Using train/validation split ratio: {train_val_split:.1%} train / {(1-train_val_split):.1%} validation")
-            
-            # Split image and mask paths
-            train_image_paths, val_image_paths, train_mask_paths, val_mask_paths = train_test_split(
-                image_paths, mask_paths, train_size=train_val_split, random_state=42
-            )
-            
+
+            split_by_plot = config.getboolean("TRAIN", "split_by_plot", fallback=True)
+            if split_by_plot:
+                # Tiles are cut with overlap, so a random tile-level split puts
+                # spatially overlapping tiles (sharing up to 50% of their pixels,
+                # and the same trees) on both sides -> leaked, optimistic metrics.
+                # Split whole plots instead so validation plots are truly unseen.
+                train_image_paths, val_image_paths, train_mask_paths, val_mask_paths = split_paths_by_plot(
+                    image_paths, mask_paths, train_size=train_val_split, random_state=42, logger_obj=logger
+                )
+            else:
+                train_image_paths, val_image_paths, train_mask_paths, val_mask_paths = train_test_split(
+                    image_paths, mask_paths, train_size=train_val_split, random_state=42
+                )
+
             logger.info(f"Train set: {len(train_image_paths)} samples | Validation set: {len(val_image_paths)} samples")
-            
-            dataset = StackedDataset(train_image_paths, train_mask_paths)
-            val_dataset = StackedDataset(val_image_paths, val_mask_paths)
+
+            label_divisor = int(config.get("TRAIN", "mask_label_divisor", fallback="10000"))
+            train_augmentation = TrainAugmentation() if TrainAugmentation is not None else None
+            dataset = StackedDataset(train_image_paths, train_mask_paths, transforms=train_augmentation,
+                                     label_divisor=label_divisor)
+            # No augmentation on validation: metrics must reflect the true data distribution.
+            val_dataset = StackedDataset(val_image_paths, val_mask_paths, label_divisor=label_divisor)
 
     # DataLoader
     batch_size = int(config.get("TRAIN", "batch_size", fallback="1"))
@@ -665,6 +887,7 @@ def main(config):
     scaler = torch.amp.GradScaler() if use_amp and device.type == 'cuda' else None
 
     best_monitor = None
+    best_epoch_number = None
     epochs_without_improvement = 0
     metrics_history = []
 
@@ -765,8 +988,11 @@ def main(config):
                     for key, value in metrics.items():
                         for metric_name in ["precision", "recall", "f1"]:
                             epoch_class_pr[f"{key}_{metric_name}"].append(value[metric_name])
-                    epoch_global_pr["mean_precision"].append(global_metrics["mean_precision"])
-                    epoch_global_pr["mean_recall"].append(global_metrics["mean_recall"])
+                    # global_metrics is {} when no class applied to this batch;
+                    # skip it rather than averaging in an unearned zero.
+                    if global_metrics:
+                        epoch_global_pr["mean_precision"].append(global_metrics["mean_precision"])
+                        epoch_global_pr["mean_recall"].append(global_metrics["mean_recall"])
                     log_metrics(logger, "Validation", epoch, {**metrics, **global_metrics}, val_batch_idx, len(val_loader))
                     logger.info(f"Epoch [{epoch + 1}/{num_epochs}] Validation Confusion Matrix (rows=true, cols=pred): {confusion.tolist()}")
 
@@ -812,6 +1038,7 @@ def main(config):
 
         if improved:
             best_monitor = monitor_value
+            best_epoch_number = epoch + 1
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
@@ -852,7 +1079,7 @@ def main(config):
     logger.info("\nGenerating final metrics and visualizations...")
     if metrics_history:
         # Generate and log final metrics summary
-        save_final_metrics_summary(metrics_history, metrics_dir, logger)
+        save_final_metrics_summary(metrics_history, metrics_dir, logger, best_epoch=best_epoch_number)
         
         save_metrics_history_csv(metrics_history, os.path.join(metrics_dir, "metrics_history.csv"))
         logger.info(f"Saved metrics history to: {os.path.join(metrics_dir, 'metrics_history.csv')}")

@@ -1,0 +1,41 @@
+================================================================================
+TRAINING FINAL METRICS SUMMARY
+================================================================================
+
+Best Epoch: 9
+Total Epochs Trained: 39
+
+FINAL EPOCH METRICS (Epoch 39):
+--------------------------------------------------------------------------------
+Training Loss:     0.746774
+Validation Loss:   2.099586
+Mean Precision:    0.371090
+Mean Recall:       0.420620
+
+CLASS-SPECIFIC METRICS (Final Epoch):
+--------------------------------------------------------------------------------
+  Class 1:
+    Precision: 0.397749
+    Recall:    0.404903
+    F1-Score:  0.380314
+  Class 2:
+    Precision: 0.368962
+    Recall:    0.400929
+    F1-Score:  0.341187
+  Class 3:
+    Precision: 0.284608
+    Recall:    0.275098
+    F1-Score:  0.263804
+  Class 4:
+    Precision: 0.376149
+    Recall:    0.469398
+    F1-Score:  0.407663
+
+BEST EPOCH METRICS (Epoch 9):
+--------------------------------------------------------------------------------
+Training Loss:     1.246953
+Validation Loss:   1.461339
+Mean Precision:    0.333802
+Mean Recall:       0.456637
+
+================================================================================

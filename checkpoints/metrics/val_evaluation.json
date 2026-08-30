@@ -1,0 +1,113 @@
+{
+  "checkpoint": "/tmp/claude-1000/-media-smartforest-Storage-Burma-MaskRCNN-MaskRcnnTreeHealth/b6c84dfc-2289-4f6b-9a68-52c807c510e6/scratchpad/midcheck.pth",
+  "epoch": 9,
+  "dataset_dir": "data/dataset_sliced_800",
+  "split": "val",
+  "tiles": 112,
+  "gt_instances": 1101,
+  "score_threshold": 0.5,
+  "iou_threshold": 0.5,
+  "per_class": {
+    "healthy": {
+      "tp": 37,
+      "fp": 37,
+      "fn": 264
+    },
+    "mild": {
+      "tp": 4,
+      "fp": 5,
+      "fn": 324
+    },
+    "moderate": {
+      "tp": 1,
+      "fp": 0,
+      "fn": 173
+    },
+    "severe": {
+      "tp": 22,
+      "fp": 25,
+      "fn": 276
+    }
+  },
+  "pooled": {
+    "precision": 0.48854961832061067,
+    "recall": 0.05812897366030881,
+    "f1": 0.10389610389610389
+  },
+  "macro": {
+    "precision": 0.6031323877068557,
+    "recall": 0.053672834945893234,
+    "f1": 0.0900092522623809
+  },
+  "class_agnostic_ap": {
+    "AP": 0.050629734631077485,
+    "AP50": 0.16861847303139704,
+    "AP75": 0.022235438530947765,
+    "AR100": 0.17211625794732063
+  },
+  "threshold_sweep": [
+    {
+      "threshold": 0.3,
+      "precision": 0.25735294117647056,
+      "recall": 0.1271571298819255,
+      "f1": 0.17021276595744678,
+      "tp": 140,
+      "fp": 404,
+      "fn": 961
+    },
+    {
+      "threshold": 0.4,
+      "precision": 0.35335689045936397,
+      "recall": 0.09082652134423251,
+      "f1": 0.1445086705202312,
+      "tp": 100,
+      "fp": 183,
+      "fn": 1001
+    },
+    {
+      "threshold": 0.5,
+      "precision": 0.48854961832061067,
+      "recall": 0.05812897366030881,
+      "f1": 0.10389610389610389,
+      "tp": 64,
+      "fp": 67,
+      "fn": 1037
+    },
+    {
+      "threshold": 0.6,
+      "precision": 0.45652173913043476,
+      "recall": 0.01907356948228883,
+      "f1": 0.036617262423714034,
+      "tp": 21,
+      "fp": 25,
+      "fn": 1080
+    },
+    {
+      "threshold": 0.7,
+      "precision": 0.4,
+      "recall": 0.0036330608537693005,
+      "f1": 0.0072007200720072,
+      "tp": 4,
+      "fp": 6,
+      "fn": 1097
+    },
+    {
+      "threshold": 0.8,
+      "precision": 1.0,
+      "recall": 0.0009082652134423251,
+      "f1": 0.0018148820326678767,
+      "tp": 1,
+      "fp": 0,
+      "fn": 1100
+    },
+    {
+      "threshold": 0.9,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 1101
+    }
+  ]
+}

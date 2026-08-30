@@ -219,3 +219,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project: large local artifacts (model weights, backups, logs)
+backup_run_*/
+*.pth
+train.log
+utils.log

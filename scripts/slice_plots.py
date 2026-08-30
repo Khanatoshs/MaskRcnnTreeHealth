@@ -22,7 +22,8 @@ def slice_plots_and_masks(
     output_base_dir,
     window_size=640,
     overlap_pct=20.0,  # overlap percentage (0-100) of window size to overlap between tiles
-    drop_empty_masks=True
+    drop_empty_masks=True,
+    min_instance_completeness=None
 ):
     """
     Slices matched plot rasters and mask rasters using an overlapping sliding window.
@@ -43,6 +44,13 @@ def slice_plots_and_masks(
         `stride = window_size - int(round(window_size * overlap_pct / 100))`.
     drop_empty_masks : bool
         If True, skips writing tiles that contain no target tree instances (mask sum == 0).
+    min_instance_completeness : float or None
+        If set (0-1), removes an instance from a tile when less than this fraction of
+        its full area in the parent plot falls inside the tile. Tiling slices crowns at
+        the tile border, leaving slivers that become tiny ground-truth boxes the model
+        cannot match - every COCO-'small' instance in this dataset is such a fragment,
+        not a genuinely small tree. Because tiles overlap, a crown cut at one tile's
+        edge is whole in a neighbour, so dropping fragments loses no trees.
     """
     # 1. Setup output directory structure
     out_images_dir = os.path.join(output_base_dir, "images")
@@ -87,7 +95,17 @@ def slice_plots_and_masks(
             img_meta = src_img.meta.copy()
             mask_meta = src_mask.meta.copy()
 
+            # Full pixel area of each instance in the whole plot, so per-tile
+            # completeness can be measured against it.
+            full_area = {}
+            if min_instance_completeness:
+                whole_mask = src_mask.read(1)
+                values, counts = np.unique(whole_mask, return_counts=True)
+                full_area = {int(v): int(c) for v, c in zip(values, counts) if v != 0}
+                del whole_mask
+
             plot_tile_count = 0
+            plot_fragments_dropped = 0
 
             # 3. Sliding window iteration over grid
             for y in range(0, height, stride):
@@ -104,6 +122,18 @@ def slice_plots_and_masks(
                     
                     # Read mask window first to check instance presence
                     mask_data = src_mask.read(window=window)
+
+                    # Drop crowns the tile boundary cut through, before the
+                    # emptiness check so a tile of pure fragments is discarded too.
+                    if min_instance_completeness and full_area:
+                        values, counts = np.unique(mask_data, return_counts=True)
+                        for value, count in zip(values, counts):
+                            if value == 0:
+                                continue
+                            whole = full_area.get(int(value))
+                            if whole and count / whole < min_instance_completeness:
+                                mask_data[mask_data == value] = 0
+                                plot_fragments_dropped += 1
 
                     # Skip saving tile if there are no tree instances present
                     if drop_empty_masks and mask_data.sum() == 0:
@@ -146,7 +176,11 @@ def slice_plots_and_masks(
                     plot_tile_count += 1
 
             total_saved_tiles += plot_tile_count
-            logger.info(f"Processed {base_name}: Generated {plot_tile_count} matched tile pairs.")
+            logger.info(
+                f"Processed {base_name}: Generated {plot_tile_count} matched tile pairs."
+                + (f" Dropped {plot_fragments_dropped} edge-truncated instance(s)."
+                   if plot_fragments_dropped else "")
+            )
 
     logger.info(f"\nCompleted! Total dataset generated: {total_saved_tiles} image/mask pairs.")
     logger.info(f"Images directory: {out_images_dir}")
@@ -164,16 +198,35 @@ if __name__ == "__main__":
     # --- Window Configuration ---
     WINDOW_SIZE = int(config.get('SLICING', 'WINDOW_SIZE', fallback='640'))
     OVERLAP_PCT = float(config.get('SLICING', 'OVERLAP_PCT', fallback='20.0'))
+    _completeness = config.get('SLICING', 'MIN_INSTANCE_COMPLETENESS', fallback='').strip()
+    MIN_INSTANCE_COMPLETENESS = float(_completeness) if _completeness else None
+    if MIN_INSTANCE_COMPLETENESS:
+        logger.info(
+            f"Dropping instances less than {MIN_INSTANCE_COMPLETENESS:.0%} complete within a tile"
+        )
 
     logger.info(f"Starting slicing of plots and masks with window size {WINDOW_SIZE}px and overlap {OVERLAP_PCT}%...")
 
-    slice_plots_and_masks(
-        plots_dir=PLOTS_DIR,
-        masks_dir=MASKS_DIR,
-        output_base_dir=OUTPUT_DATASET_DIR,
-        window_size=WINDOW_SIZE,
-        overlap_pct=OVERLAP_PCT,
-        drop_empty_masks=True  # Filter out background-only tiles
-    )
+    # Slice the held-out test plots into their own dataset directory too, so the
+    # final evaluation never has to touch the train/val dataset.
+    splits = [(PLOTS_DIR, MASKS_DIR, OUTPUT_DATASET_DIR)]
+    test_plots_dir = config.get('SLICING', 'TEST_PLOTS_DIR', fallback='').strip()
+    test_masks_dir = config.get('SLICING', 'TEST_MASKS_DIR', fallback='').strip()
+    test_output_dir = config.get('SLICING', 'TEST_OUTPUT_DIR', fallback='').strip()
+    if test_plots_dir and test_masks_dir and test_output_dir:
+        splits.append((test_plots_dir, test_masks_dir, test_output_dir))
 
-    logger.info(f"Slicing completed. Dataset saved to {OUTPUT_DATASET_DIR}.")
+    for plots_dir, masks_dir, output_dir in splits:
+        if not os.path.isdir(plots_dir):
+            logger.warning(f"Plots directory not found, skipping: {plots_dir}")
+            continue
+        slice_plots_and_masks(
+            plots_dir=plots_dir,
+            masks_dir=masks_dir,
+            output_base_dir=output_dir,
+            window_size=WINDOW_SIZE,
+            overlap_pct=OVERLAP_PCT,
+            drop_empty_masks=True,  # Filter out background-only tiles
+            min_instance_completeness=MIN_INSTANCE_COMPLETENESS
+        )
+        logger.info(f"Slicing completed. Dataset saved to {output_dir}.")

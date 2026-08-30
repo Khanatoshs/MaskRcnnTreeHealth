@@ -6,13 +6,20 @@ import numpy as np
 class StackedImageInstanceMaskDataset(Dataset):
     """
     Expects:
-      - image_paths: list of stacked multi-channel GeoTIFF paths (e.g., 5-channel)
-      - mask_paths: list of single-channel instance-ID mask TIFFs (0 = background, 1..N instance ids)
-      - transforms: callable(image, target) -> (image, target) for augmentations (optional)
+      - image_paths: list of stacked multi-channel GeoTIFF paths (e.g., 5-channel or 8-channel)
+      - mask_paths: list of single-channel mask TIFFs (0 = background, 1..N = class/instance IDs)
+    
+    Mask format:
+      - 0: background (no trees)
+      - 1-N: tree classes (e.g., 1-4 for different health classes)
+    
     Returns (image_tensor, target) where:
-      - image_tensor: FloatTensor [C, H, W], dtype=torch.float32
-      - target: dict with 'boxes' (FloatTensor [N,4]), 'labels' (Int64Tensor [N]),
-                'masks' (UInt8Tensor [N,H,W]), 'image_id' (Int64Tensor [1])
+      - image_tensor: FloatTensor [C, H, W], dtype=torch.float32, values in [0, 1] if normalized
+      - target: dict with keys:
+        - 'boxes': FloatTensor [N,4] in format [xmin, ymin, xmax, ymax]
+        - 'labels': Int64Tensor [N] with class labels (1-based, matching mask values)
+        - 'masks': UInt8Tensor [N,H,W] binary masks for each instance/class
+        - 'image_id': Int64Tensor [1] with image index
     """
     def __init__(self, image_paths, mask_paths, transforms=None, image_norm=True, drop_alpha=False):
         assert len(image_paths) == len(mask_paths)
@@ -44,31 +51,40 @@ class StackedImageInstanceMaskDataset(Dataset):
                         img = img / 255.0
         image_tensor = torch.from_numpy(img)
 
-        # Read the single-channel instance mask (uint16 or uint8)
+        # Read the single-channel mask (uint16 or uint8)
+        # Mask format: 0 = background, 1-N = tree classes or instance IDs
         with rasterio.open(self.mask_paths[idx]) as src:
-            inst_mask = src.read(1).astype(np.uint16)  # shape: [H, W]
+            mask_data = src.read(1).astype(np.uint16)  # shape: [H, W]
 
-        # Convert instance mask to per-instance binary masks + boxes + labels
-        instance_ids = np.unique(inst_mask)
-        instance_ids = instance_ids[instance_ids != 0]  # drop background
+        # Extract unique class/instance IDs from mask
+        unique_ids = np.unique(mask_data)
+        unique_ids = unique_ids[unique_ids != 0]  # drop background
+        
         masks = []
         boxes = []
         labels = []
-        for iid in instance_ids:
-            bin_mask = (inst_mask == iid).astype(np.uint8)
+        
+        for mask_id in unique_ids:
+            # Create binary mask for this class/instance
+            bin_mask = (mask_data == mask_id).astype(np.uint8)
             pos = np.where(bin_mask)
+            
             if pos[0].size == 0:
                 continue
+            
             ymin = float(np.min(pos[0]))
             ymax = float(np.max(pos[0]))
             xmin = float(np.min(pos[1]))
             xmax = float(np.max(pos[1]))
+            
             # Skip degenerate boxes
             if xmax <= xmin or ymax <= ymin:
                 continue
+            
             masks.append(bin_mask)
             boxes.append([xmin, ymin, xmax, ymax])
-            labels.append(1)  # default single class 'tree' -> 1
+            # Use the mask value as the class label (1-4 for tree classes)
+            labels.append(int(mask_id))
 
         if len(masks) == 0:
             # Return empty target following torchvision expectations

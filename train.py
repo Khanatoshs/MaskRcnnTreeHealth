@@ -13,6 +13,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
+from sklearn.model_selection import train_test_split
 import torchvision
 from torchvision.models.detection import MaskRCNN
 from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
@@ -28,6 +29,11 @@ except Exception:
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 logging.basicConfig(level=logging.INFO, filename = "train.log" ,format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Note: For debugging CUDA errors, run training with:
+# CUDA_LAUNCH_BLOCKING=1 python train.py config.ini
+# This will provide more detailed error information for GPU kernel failures.
 logger = logging.getLogger("Train_MaskRCNN")
 
 # =====================================================================
@@ -157,8 +163,16 @@ def compute_iou(box_a, box_b):
     return 0.0 if union <= 0 else inter / union
 
 
-def compute_class_prf(predictions, targets, score_threshold=0.5, iou_threshold=0.5):
-    """Compute per-class precision, recall, and F1 from detection predictions and ground truth targets."""
+def compute_class_prf(predictions, targets, score_threshold=0.5, iou_threshold=0.5, num_classes=None):
+    """Compute per-class precision, recall, and F1 from detection predictions and ground truth targets.
+    
+    Args:
+        predictions: List of prediction dicts with 'labels', 'boxes', 'scores'
+        targets: List of target dicts with 'labels', 'boxes'
+        score_threshold: Minimum confidence score for predictions
+        iou_threshold: Minimum IoU for matching predictions to targets
+        num_classes: Number of classes (1 to num_classes). If None, only classes in batch are computed.
+    """
     if predictions is None:
         predictions = []
     if targets is None:
@@ -171,9 +185,13 @@ def compute_class_prf(predictions, targets, score_threshold=0.5, iou_threshold=0
     for pred in predictions:
         labels = pred.get("labels", torch.empty(0, dtype=torch.int64))
         all_classes.update(int(label.item()) for label in labels)
+    
+    # If num_classes is specified, ensure all classes 1 to num_classes are evaluated
+    if num_classes is not None:
+        all_classes.update(range(1, num_classes))
 
     if not all_classes:
-        return {"class_0": {"precision": 0.0, "recall": 0.0, "f1": 0.0}}
+        return {"class_1": {"precision": 0.0, "recall": 0.0, "f1": 0.0}}
 
     metrics = {}
     for cls_id in sorted(all_classes):
@@ -240,9 +258,9 @@ def compute_class_prf(predictions, targets, score_threshold=0.5, iou_threshold=0
     return metrics
 
 
-def compute_global_pr_metrics(predictions, targets, score_threshold=0.5, iou_threshold=0.5):
-    """Compute macro mean precision and recall over the classes represented in the targets/predictions."""
-    class_metrics = compute_class_prf(predictions, targets, score_threshold=score_threshold, iou_threshold=iou_threshold)
+def compute_global_pr_metrics(predictions, targets, score_threshold=0.5, iou_threshold=0.5, num_classes=None):
+    """Compute macro mean precision and recall over all classes."""
+    class_metrics = compute_class_prf(predictions, targets, score_threshold=score_threshold, iou_threshold=iou_threshold, num_classes=num_classes)
     if not class_metrics:
         return {"mean_precision": 0.0, "mean_recall": 0.0}
 
@@ -329,6 +347,105 @@ def save_confusion_matrix(confusion_matrix, path):
     plt.close(fig)
 
 
+def save_final_metrics_summary(metrics_history, metrics_dir, logger_obj):
+    """
+    Save a comprehensive final metrics summary to a text file and log it.
+    """
+    if not metrics_history:
+        return
+    
+    final_metrics = metrics_history[-1]
+    best_metrics = max(metrics_history, key=lambda x: x.get("mean_precision", 0))
+    
+    summary_path = os.path.join(metrics_dir, "final_metrics.txt")
+    
+    with open(summary_path, "w") as f:
+        f.write("=" * 80 + "\n")
+        f.write("TRAINING FINAL METRICS SUMMARY\n")
+        f.write("=" * 80 + "\n\n")
+        
+        # Best epoch information
+        f.write(f"Best Epoch: {int(best_metrics['epoch'])}\n")
+        f.write(f"Total Epochs Trained: {len(metrics_history)}\n\n")
+        
+        # Final epoch metrics
+        f.write("FINAL EPOCH METRICS (Epoch {}):\n".format(int(final_metrics['epoch'])))
+        f.write("-" * 80 + "\n")
+        f.write(f"Training Loss:     {final_metrics.get('train_loss', 0):.6f}\n")
+        f.write(f"Validation Loss:   {final_metrics.get('val_loss', 0):.6f}\n")
+        f.write(f"Mean Precision:    {final_metrics.get('mean_precision', 0):.6f}\n")
+        f.write(f"Mean Recall:       {final_metrics.get('mean_recall', 0):.6f}\n\n")
+        
+        # Class-specific metrics
+        class_metrics = {k: v for k, v in final_metrics.items() if k.startswith("class_") and not k.endswith("_precision") and not k.endswith("_recall") and not k.endswith("_f1")}
+        
+        if any(k for k in final_metrics.keys() if k.startswith("class_") and k.endswith("_precision")):
+            f.write("CLASS-SPECIFIC METRICS (Final Epoch):\n")
+            f.write("-" * 80 + "\n")
+            
+            # Get unique class numbers
+            class_nums = sorted(set(int(k.split("_")[1]) for k in final_metrics.keys() if k.startswith("class_") and k.endswith("_precision")))
+            
+            for class_num in class_nums:
+                precision_key = f"class_{class_num}_precision"
+                recall_key = f"class_{class_num}_recall"
+                f1_key = f"class_{class_num}_f1"
+                
+                precision = final_metrics.get(precision_key, 0.0)
+                recall = final_metrics.get(recall_key, 0.0)
+                f1 = final_metrics.get(f1_key, 0.0)
+                
+                f.write(f"  Class {class_num}:\n")
+                f.write(f"    Precision: {precision:.6f}\n")
+                f.write(f"    Recall:    {recall:.6f}\n")
+                f.write(f"    F1-Score:  {f1:.6f}\n")
+            f.write("\n")
+        
+        # Best epoch metrics
+        f.write("BEST EPOCH METRICS (Epoch {}):\n".format(int(best_metrics['epoch'])))
+        f.write("-" * 80 + "\n")
+        f.write(f"Training Loss:     {best_metrics.get('train_loss', 0):.6f}\n")
+        f.write(f"Validation Loss:   {best_metrics.get('val_loss', 0):.6f}\n")
+        f.write(f"Mean Precision:    {best_metrics.get('mean_precision', 0):.6f}\n")
+        f.write(f"Mean Recall:       {best_metrics.get('mean_recall', 0):.6f}\n\n")
+        
+        f.write("=" * 80 + "\n")
+    
+    # Log the summary to console/log file
+    logger_obj.info("\n" + "=" * 80)
+    logger_obj.info("TRAINING FINAL METRICS SUMMARY")
+    logger_obj.info("=" * 80)
+    logger_obj.info(f"Best Epoch: {int(best_metrics['epoch'])}")
+    logger_obj.info(f"Total Epochs Trained: {len(metrics_history)}")
+    logger_obj.info("")
+    logger_obj.info(f"Final Epoch ({int(final_metrics['epoch'])}) Metrics:")
+    logger_obj.info(f"  Training Loss:     {final_metrics.get('train_loss', 0):.6f}")
+    logger_obj.info(f"  Validation Loss:   {final_metrics.get('val_loss', 0):.6f}")
+    logger_obj.info(f"  Mean Precision:    {final_metrics.get('mean_precision', 0):.6f}")
+    logger_obj.info(f"  Mean Recall:       {final_metrics.get('mean_recall', 0):.6f}")
+    
+    # Log class-specific metrics
+    if any(k for k in final_metrics.keys() if k.startswith("class_") and k.endswith("_precision")):
+        logger_obj.info("")
+        logger_obj.info("Class-Specific Metrics (Final Epoch):")
+        class_nums = sorted(set(int(k.split("_")[1]) for k in final_metrics.keys() if k.startswith("class_") and k.endswith("_precision")))
+        
+        for class_num in class_nums:
+            precision = final_metrics.get(f"class_{class_num}_precision", 0.0)
+            recall = final_metrics.get(f"class_{class_num}_recall", 0.0)
+            f1 = final_metrics.get(f"class_{class_num}_f1", 0.0)
+            logger_obj.info(f"  Class {class_num}: Precision={precision:.6f}, Recall={recall:.6f}, F1={f1:.6f}")
+    
+    logger_obj.info("")
+    logger_obj.info(f"Best Epoch ({int(best_metrics['epoch'])}) Metrics:")
+    logger_obj.info(f"  Training Loss:     {best_metrics.get('train_loss', 0):.6f}")
+    logger_obj.info(f"  Validation Loss:   {best_metrics.get('val_loss', 0):.6f}")
+    logger_obj.info(f"  Mean Precision:    {best_metrics.get('mean_precision', 0):.6f}")
+    logger_obj.info(f"  Mean Recall:       {best_metrics.get('mean_recall', 0):.6f}")
+    logger_obj.info("=" * 80 + "\n")
+    logger_obj.info(f"Saved final metrics summary to: {summary_path}")
+
+
 def save_metrics_history_csv(history, path):
     """Save per-epoch metrics as a CSV table."""
     if not history:
@@ -350,15 +467,32 @@ def save_metric_plots(history, metrics_dir):
         return
 
     epochs = [entry["epoch"] for entry in history]
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    
+    # Plot overall metrics (mean precision/recall) + per-class metrics
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle("Training Metrics Progression")
 
     metric_names = [
-        ("mean_precision", "Mean Precision"),
-        ("mean_recall", "Mean Recall"),
-        ("class_1_precision", "Class 1 Precision"),
-        ("class_1_recall", "Class 1 Recall"),
+        ("mean_precision", "Mean Precision (All Classes)"),
+        ("mean_recall", "Mean Recall (All Classes)"),
     ]
+
+    # Find all class metrics available
+    all_class_metrics = set()
+    for entry in history:
+        for key in entry.keys():
+            if key.startswith("class_") and key.endswith("_precision"):
+                class_num = key.replace("class_", "").replace("_precision", "")
+                all_class_metrics.add(class_num)
+
+    # Add class precision/recall to plot (up to 4 classes, or adjust as needed)
+    class_list = sorted(all_class_metrics, key=lambda x: int(x))
+    if class_list:
+        first_class = class_list[0]
+        metric_names.extend([
+            (f"class_{first_class}_precision", f"Class {first_class} Precision"),
+            (f"class_{first_class}_recall", f"Class {first_class} Recall"),
+        ])
 
     for idx, (metric_name, title) in enumerate(metric_names):
         ax = axes[idx // 2, idx % 2]
@@ -368,10 +502,41 @@ def save_metric_plots(history, metrics_dir):
         ax.set_xlabel("Epoch")
         ax.set_ylabel(metric_name)
         ax.grid(True, alpha=0.3)
+        ax.set_ylim([0, 1.0])
 
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     fig.savefig(os.path.join(metrics_dir, "metric_progression.png"), dpi=200)
     plt.close(fig)
+
+    # Plot per-class metrics if multiple classes exist
+    if len(class_list) > 1:
+        num_classes = len(class_list)
+        fig, axes = plt.subplots(num_classes, 1, figsize=(12, 4 * num_classes))
+        if num_classes == 1:
+            axes = [axes]
+        
+        for ax, class_num in zip(axes, class_list):
+            precision_key = f"class_{class_num}_precision"
+            recall_key = f"class_{class_num}_recall"
+            f1_key = f"class_{class_num}_f1"
+            
+            precision_vals = [entry.get(precision_key, np.nan) for entry in history]
+            recall_vals = [entry.get(recall_key, np.nan) for entry in history]
+            f1_vals = [entry.get(f1_key, np.nan) for entry in history]
+            
+            ax.plot(epochs, precision_vals, marker="o", label="Precision", linewidth=2)
+            ax.plot(epochs, recall_vals, marker="s", label="Recall", linewidth=2)
+            ax.plot(epochs, f1_vals, marker="^", label="F1-Score", linewidth=2)
+            ax.set_title(f"Class {class_num} Metrics")
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel("Score")
+            ax.set_ylim([0, 1.0])
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        
+        fig.tight_layout()
+        fig.savefig(os.path.join(metrics_dir, "per_class_metrics.png"), dpi=200)
+        plt.close(fig)
 
     # confusion matrix plot by epoch if available
     if "epoch_confusion" in history[0]:
@@ -456,15 +621,28 @@ def main(config):
             dataset = StackedDataset(rgb_files, ndvi_files, chm_files, dummy_annotations)
             val_dataset = StackedDataset(rgb_files, ndvi_files, chm_files, dummy_annotations)
         else:
-            dataset = StackedDataset(image_paths, mask_paths)
-            val_dataset = StackedDataset(image_paths, mask_paths)
+            # Get train/validation split ratio from config
+            train_val_split = float(config.get("TRAIN", "train_val_split", fallback="0.8"))
+            logger.info(f"Using train/validation split ratio: {train_val_split:.1%} train / {(1-train_val_split):.1%} validation")
+            
+            # Split image and mask paths
+            train_image_paths, val_image_paths, train_mask_paths, val_mask_paths = train_test_split(
+                image_paths, mask_paths, train_size=train_val_split, random_state=42
+            )
+            
+            logger.info(f"Train set: {len(train_image_paths)} samples | Validation set: {len(val_image_paths)} samples")
+            
+            dataset = StackedDataset(train_image_paths, train_mask_paths)
+            val_dataset = StackedDataset(val_image_paths, val_mask_paths)
 
     # DataLoader
     batch_size = int(config.get("TRAIN", "batch_size", fallback="1"))
+    val_batch_size = int(config.get("TRAIN", "val_batch_size", fallback=str(max(1, batch_size // 2))))
     num_workers = int(config.get("TRAIN", "num_workers", fallback="4"))
     pin_memory = config.getboolean("TRAIN", "pin_memory", fallback=True)
     data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=num_workers, pin_memory=pin_memory)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=num_workers, pin_memory=pin_memory)
+    val_loader = DataLoader(val_dataset, batch_size=val_batch_size, shuffle=False, collate_fn=collate_fn, num_workers=num_workers, pin_memory=pin_memory)
+    logger.info(f"Training batch size: {batch_size} | Validation batch size: {val_batch_size}")
 
     # Optimizer and training configuration
     learning_rate = float(config.get("TRAIN", "learning_rate", fallback="1e-4"))
@@ -488,7 +666,6 @@ def main(config):
 
     best_monitor = None
     epochs_without_improvement = 0
-    save_best_only = config.getboolean("TRAIN", "save_best_only", fallback=False)
     metrics_history = []
 
     for epoch in range(num_epochs):
@@ -522,6 +699,11 @@ def main(config):
             running_loss += losses.item()
             log_metrics(logger, "Train", epoch, dict(loss_dict), batch_idx, len(data_loader))
 
+            # Periodic GPU memory cleanup to prevent OOM
+            if device.type == 'cuda' and batch_idx % 10 == 0:
+                torch.cuda.empty_cache()
+                gc.collect()
+
         train_loss = running_loss / max(1, len(data_loader))
         logger.info(f"Epoch [{epoch + 1}/{num_epochs}] Average Training Loss: {train_loss:.4f}")
 
@@ -534,26 +716,51 @@ def main(config):
 
         with torch.no_grad():
             for val_batch_idx, (val_images, val_targets) in enumerate(val_loader, 1):
-                val_images = [img.to(device) for img in val_images]
-                val_targets = [{k: v.to(device) for k, v in t.items()} for t in val_targets]
+                try:
+                    val_images = [img.to(device) for img in val_images]
+                    val_targets = [{k: v.to(device) for k, v in t.items()} for t in val_targets]
 
-                if use_amp:
-                    with torch.amp.autocast():
-                        val_output = model(val_images, val_targets)
-                else:
-                    val_output = model(val_images, val_targets)
+                    # Mask R-CNN returns a loss dict only when called in training mode with targets.
+                    # For inference metrics, we must switch back to eval mode with targets=None.
+                    was_training = model.training
+                    model.train()
+                    try:
+                        with torch.no_grad():
+                            if use_amp:
+                                with torch.amp.autocast():
+                                    val_loss_dict = model(val_images, val_targets)
+                            else:
+                                val_loss_dict = model(val_images, val_targets)
+                    finally:
+                        if not was_training:
+                            model.eval()
 
-                if isinstance(val_output, dict):
-                    val_loss_dict = val_output
-                    val_losses = sum(loss for loss in val_loss_dict.values())
-                    val_loss_value = val_losses.item()
-                    val_running_loss += val_loss_value
-                    log_metrics(logger, "Validation", epoch, val_loss_dict, val_batch_idx, len(val_loader))
-                else:
-                    val_loss_value = float('nan')
-                    metrics = compute_class_prf(val_output, val_targets, score_threshold=0.5, iou_threshold=iou_threshold)
-                    global_metrics = compute_global_pr_metrics(val_output, val_targets, score_threshold=0.5, iou_threshold=iou_threshold)
-                    confusion = compute_confusion_matrix(val_output, val_targets, score_threshold=0.5, iou_threshold=iou_threshold, num_classes=NUM_CLASSES)
+                    if isinstance(val_loss_dict, dict):
+                        val_losses = sum(loss for loss in val_loss_dict.values())
+                        val_loss_value = val_losses.item()
+                        val_running_loss += val_loss_value
+                        log_metrics(logger, "Validation", epoch, val_loss_dict, val_batch_idx, len(val_loader))
+                    else:
+                        # Fallback if model returns predictions instead of losses
+                        val_loss_value = float('nan')
+
+                    # Get validation predictions in eval mode without targets.
+                    model.eval()
+                    try:
+                        with torch.no_grad():
+                            if use_amp:
+                                with torch.amp.autocast():
+                                    val_predictions = model([img for img in val_images])
+                            else:
+                                val_predictions = model([img for img in val_images])
+                    finally:
+                        if was_training:
+                            model.train()
+
+                    # Compute metrics from predictions
+                    metrics = compute_class_prf(val_predictions, val_targets, score_threshold=0.5, iou_threshold=iou_threshold, num_classes=NUM_CLASSES)
+                    global_metrics = compute_global_pr_metrics(val_predictions, val_targets, score_threshold=0.5, iou_threshold=iou_threshold, num_classes=NUM_CLASSES)
+                    confusion = compute_confusion_matrix(val_predictions, val_targets, score_threshold=0.5, iou_threshold=iou_threshold, num_classes=NUM_CLASSES)
                     epoch_confusion += confusion
                     for key, value in metrics.items():
                         for metric_name in ["precision", "recall", "f1"]:
@@ -562,9 +769,21 @@ def main(config):
                     epoch_global_pr["mean_recall"].append(global_metrics["mean_recall"])
                     log_metrics(logger, "Validation", epoch, {**metrics, **global_metrics}, val_batch_idx, len(val_loader))
                     logger.info(f"Epoch [{epoch + 1}/{num_epochs}] Validation Confusion Matrix (rows=true, cols=pred): {confusion.tolist()}")
-                    logger.warning(
-                        f"Epoch [{epoch + 1}/{num_epochs}] Validation Batch {val_batch_idx}/{len(val_loader)} returned detections list instead of losses; loss aggregation skipped."
-                    )
+
+                    # Clear GPU cache after each validation batch to prevent OOM
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+
+                except RuntimeError as e:
+                    if 'CUDA' in str(e) or 'cuda' in str(e):
+                        logger.error(f"CUDA error during validation batch {val_batch_idx}: {e}")
+                        logger.error("GPU memory may be exhausted. Try reducing val_batch_size in config.ini or enable CUDA_LAUNCH_BLOCKING=1 for debugging.")
+                        if device.type == 'cuda':
+                            torch.cuda.empty_cache()
+                        # Skip this batch and continue
+                        continue
+                    else:
+                        raise
 
         val_loss = val_running_loss / max(1, len(val_loader))
         logger.info(f"Epoch [{epoch + 1}/{num_epochs}] Average Validation Loss: {val_loss:.4f}")
@@ -603,30 +822,10 @@ def main(config):
         )
 
         metrics_history.append(epoch_summary)
-        save_confusion_matrix(epoch_confusion, os.path.join(metrics_dir, f"confusion_matrix_epoch_{epoch + 1}.csv"))
-        save_metrics_history_csv(metrics_history, os.path.join(metrics_dir, "metrics_history.csv"))
-        save_metric_plots(metrics_history, metrics_dir)
-        if len(metrics_history) > 1:
-            all_confusions = np.stack([np.asarray(entry["epoch_confusion"]) for entry in metrics_history if "epoch_confusion" in entry])
-            if all_confusions.size > 0:
-                final_confusion = all_confusions[-1]
-                save_confusion_matrix(final_confusion, os.path.join(metrics_dir, "latest_confusion_matrix.csv"))
 
-        # Save checkpoint (best or every epoch)
-        checkpoint_path = os.path.join(checkpoint_dir, f"maskrcnn_epoch_{epoch + 1}.pth")
-        if save_best_only:
-            if improved:
-                torch.save({
-                    'epoch': epoch + 1,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'train_loss': train_loss,
-                    'val_loss': val_loss,
-                    'learning_rate': learning_rate,
-                    'weight_decay': weight_decay,
-                }, checkpoint_path)
-                logger.info(f"Saved BEST checkpoint to: {checkpoint_path}")
-        else:
+        # Save checkpoint (best model only)
+        checkpoint_path = os.path.join(checkpoint_dir, "maskrcnn_best.pth")
+        if improved:
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
@@ -636,7 +835,7 @@ def main(config):
                 'learning_rate': learning_rate,
                 'weight_decay': weight_decay,
             }, checkpoint_path)
-            logger.info(f"Saved checkpoint to: {checkpoint_path}")
+            logger.info(f"Saved BEST checkpoint to: {checkpoint_path}")
 
         if epochs_without_improvement >= early_stopping_patience:
             logger.info(
@@ -648,6 +847,26 @@ def main(config):
         if torch.cuda.is_available() and config.get("TRAIN", "device", fallback="cuda") == "cuda":
             torch.cuda.empty_cache()
         gc.collect()
+
+    # Save all metrics files at the end of training
+    logger.info("\nGenerating final metrics and visualizations...")
+    if metrics_history:
+        # Generate and log final metrics summary
+        save_final_metrics_summary(metrics_history, metrics_dir, logger)
+        
+        save_metrics_history_csv(metrics_history, os.path.join(metrics_dir, "metrics_history.csv"))
+        logger.info(f"Saved metrics history to: {os.path.join(metrics_dir, 'metrics_history.csv')}")
+        
+        save_metric_plots(metrics_history, metrics_dir)
+        logger.info(f"Saved metric plots to: {metrics_dir}")
+        
+        # Save final confusion matrix
+        if len(metrics_history) > 0:
+            final_confusion = np.asarray(metrics_history[-1]["epoch_confusion"])
+            save_confusion_matrix(final_confusion, os.path.join(metrics_dir, "final_confusion_matrix.csv"))
+            logger.info(f"Saved final confusion matrix to: {os.path.join(metrics_dir, 'final_confusion_matrix.csv')}")
+    
+    logger.info("Training completed successfully!")
 
 if __name__ == "__main__":
     config = configparser.ConfigParser()

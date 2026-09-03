@@ -29,8 +29,8 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from train import (get_multiband_maskrcnn, collate_fn, compute_iou,
-                   plot_id_from_tile_path, split_paths_by_plot)
+from train import (get_multiband_maskrcnn, get_image_preprocessing_mode, collate_fn,
+                   compute_iou, plot_id_from_tile_path, split_paths_by_plot)
 from dataset.multi_channel_dataset import StackedImageInstanceMaskDataset
 
 CLASS_NAMES = {1: "healthy", 2: "mild", 3: "moderate", 4: "severe"}
@@ -38,13 +38,13 @@ CLASS_NAMES = {1: "healthy", 2: "mild", 3: "moderate", 4: "severe"}
 
 def load_config():
     config = configparser.ConfigParser()
-    config.read("config.ini")
+    config.read(os.environ.get("MASKRCNN_CONFIG", "config.ini"))
     if not config.has_section("TRAIN"):
         raise SystemExit("config.ini with a [TRAIN] section not found - run from the repo root.")
     return config
 
 
-def build_loader(dataset_dir, label_divisor, split, train_val_split, num_workers):
+def build_loader(dataset_dir, label_divisor, split, train_val_split, num_workers, input_mode):
     image_paths = sorted(glob.glob(os.path.join(dataset_dir, "images", "*.tif")))
     mask_paths = sorted(glob.glob(os.path.join(dataset_dir, "masks", "*.tif")))
     if not image_paths:
@@ -61,7 +61,8 @@ def build_loader(dataset_dir, label_divisor, split, train_val_split, num_workers
     plots = sorted({plot_id_from_tile_path(p) for p in image_paths} - {None})
     print(f"Evaluating {len(image_paths)} tiles from {len(plots)} plots: {', '.join(plots)}\n")
 
-    dataset = StackedImageInstanceMaskDataset(image_paths, mask_paths, label_divisor=label_divisor)
+    dataset = StackedImageInstanceMaskDataset(image_paths, mask_paths, label_divisor=label_divisor,
+                                              input_mode=input_mode)
     return DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_fn,
                       num_workers=num_workers)
 
@@ -210,74 +211,104 @@ def class_agnostic_ap(cached, out_dir):
 
 def main():
     config = load_config()
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_dir",
-                        default=config.get("SLICING", "TEST_OUTPUT_DIR",
-                                           fallback="data/dataset_sliced_800_test"))
-    parser.add_argument("--split", choices=["all", "val"], default="all",
+    # Settings live in config.ini's [EVAL] section. The flags below only override
+    # it for a one-off; nothing here has to be passed for a normal run.
+    S = "EVAL"
+    parser = argparse.ArgumentParser(
+        description="Score a checkpoint on a split. Reads [EVAL] from config.ini.")
+    parser.add_argument("--dataset_dir", default=None)
+    parser.add_argument("--split", choices=["all", "val"], default=None,
                         help="'all' scores every tile in dataset_dir (use for the test set); "
                              "'val' reproduces train.py's plot-level validation split.")
-    parser.add_argument("--checkpoint",
-                        default=os.path.join(config.get("TRAIN", "checkpoint_dir", fallback="checkpoints"),
-                                             "maskrcnn_best.pth"))
-    parser.add_argument("--score_threshold", type=float, default=0.5)
-    parser.add_argument("--iou_threshold", type=float,
-                        default=float(config.get("TRAIN", "iou_threshold", fallback="0.5")))
+    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--score_threshold", type=float, default=None)
+    parser.add_argument("--iou_threshold", type=float, default=None)
     parser.add_argument("--out_dir", default=None)
-    parser.add_argument("--image_mean", default=None,
-                        help="Comma-separated per-channel means overriding config.ini. Needed when "
-                             "evaluating a checkpoint trained under different normalization; pass "
-                             "'fallback' for the built-in ImageNet+0.5 defaults.")
-    parser.add_argument("--image_std", default=None,
-                        help="Comma-separated per-channel stds overriding config.ini.")
     args = parser.parse_args()
+
+    def cfg(key, fallback=""):
+        return config.get(S, key, fallback=fallback).strip()
+
+    def cfg_floats(key):
+        return [float(v) for v in cfg(key).split(",") if v.strip()] or None
+
+    def cfg_anchors(key):
+        raw = cfg(key)
+        if not raw:
+            return None
+        if ";" in raw:
+            return [[int(s) for s in lv.split(",") if s.strip()] for lv in raw.split(";") if lv.strip()]
+        return [int(s) for s in raw.split(",") if s.strip()]
+
+    args.split = args.split or cfg("SPLIT", "all")
+    args.checkpoint = args.checkpoint or cfg("CHECKPOINT") or os.path.join(
+        config.get("TRAIN", "checkpoint_dir", fallback="checkpoints"), "maskrcnn_best.pth")
+    args.dataset_dir = args.dataset_dir or cfg("DATASET_DIR") or config.get(
+        "SLICING", "TEST_OUTPUT_DIR", fallback="data/dataset_sliced_800_test")
+    if args.score_threshold is None:
+        args.score_threshold = float(cfg("SCORE_THRESHOLD", "0.5"))
+    if args.iou_threshold is None:
+        args.iou_threshold = float(cfg("IOU_THRESHOLD",
+                                       config.get("TRAIN", "iou_threshold", fallback="0.5")))
 
     num_classes = int(config.get("TRAIN", "num_classes", fallback="5"))
     in_channels = int(config.get("TRAIN", "num_input_channels", fallback="8"))
     label_divisor = int(config.get("TRAIN", "mask_label_divisor", fallback="10000"))
     train_val_split = float(config.get("TRAIN", "train_val_split", fallback="0.8"))
     num_workers = int(config.get("TRAIN", "num_workers", fallback="2"))
-    out_dir = args.out_dir or config.get("TRAIN", "metrics_dir", fallback="checkpoints/metrics")
+    input_preprocessing = get_image_preprocessing_mode(config)
+    out_dir = args.out_dir or cfg("OUT_DIR") or config.get(
+        "TRAIN", "metrics_dir", fallback="checkpoints/metrics")
     os.makedirs(out_dir, exist_ok=True)
 
-    _anchor_raw = config.get("TRAIN", "anchor_sizes", fallback="").strip()
-    if ";" in _anchor_raw:
-        anchor_sizes = [[int(s) for s in level.split(",") if s.strip()]
-                        for level in _anchor_raw.split(";") if level.strip()] or None
-    else:
-        anchor_sizes = [int(s) for s in _anchor_raw.split(",") if s.strip()] or None
-    anchor_ratios = [float(r) for r in config.get("TRAIN", "anchor_aspect_ratios", fallback="").split(",") if r.strip()] or None
-    # These MUST match what the checkpoint was trained with. Evaluating with
-    # different normalization silently produces garbage predictions rather than
-    # an error, because normalization lives in the model's transform, not its
-    # state_dict - nothing in load_state_dict can catch the mismatch.
-    def _norm(cli_value, config_key):
-        if cli_value is not None:
-            if cli_value.strip().lower() == "fallback":
-                return None
-            return [float(v) for v in cli_value.split(",") if v.strip()]
-        return [float(v) for v in config.get("TRAIN", config_key, fallback="").split(",") if v.strip()] or None
-
-    image_mean = _norm(args.image_mean, "image_mean")
-    image_std = _norm(args.image_std, "image_std")
+    # Only used when the checkpoint predates the stored architecture. Normalization
+    # must match what the checkpoint was trained with: it lives in the model's
+    # transform, not its state_dict, so a mismatch raises no error and silently
+    # yields nonsense.
+    anchor_sizes = cfg_anchors("LEGACY_ANCHOR_SIZES")
+    anchor_ratios = cfg_floats("LEGACY_ANCHOR_ASPECT_RATIOS")
+    image_mean = cfg_floats("LEGACY_IMAGE_MEAN")
+    image_std = cfg_floats("LEGACY_IMAGE_STD")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt = torch.load(args.checkpoint, map_location=device)
+
+    # Prefer the architecture recorded in the checkpoint over whatever config.ini
+    # currently holds; an explicit CLI override still wins.
+    arch = ckpt.get("arch") or {}
+    if arch:
+        arch_source = "checkpoint"
+        num_classes = arch.get("num_classes", num_classes)
+        in_channels = arch.get("in_channels", in_channels)
+        label_divisor = arch.get("mask_label_divisor", label_divisor)
+        anchor_sizes = arch.get("anchor_sizes", anchor_sizes)
+        anchor_ratios = arch.get("anchor_aspect_ratios", anchor_ratios)
+        image_mean = arch.get("image_mean", image_mean)
+        image_std = arch.get("image_std", image_std)
+    else:
+        arch_source = "config.ini LEGACY_*" if anchor_sizes or image_mean else "config.ini [TRAIN]"
+        if image_mean is None:
+            image_mean = [float(v) for v in config.get("TRAIN", "image_mean", fallback="").split(",")
+                          if v.strip()] or None
+            image_std = [float(v) for v in config.get("TRAIN", "image_std", fallback="").split(",")
+                         if v.strip()] or None
+
     model = get_multiband_maskrcnn(num_classes=num_classes, in_channels=in_channels,
                                    anchor_sizes=anchor_sizes, anchor_aspect_ratios=anchor_ratios,
                                    image_mean=image_mean, image_std=image_std)
-    ckpt = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device).eval()
     print(f"Checkpoint: {args.checkpoint} (epoch {ckpt.get('epoch')}, "
           f"val_loss {ckpt.get('val_loss', float('nan')):.4f})")
     print(f"Dataset:    {args.dataset_dir} (split={args.split})")
+    print(f"Arch from:  {arch_source}")
     print(f"Anchors:    sizes={anchor_sizes} ratios={anchor_ratios}")
     print(f"Norm mean:  {image_mean}")
     print(f"Norm std:   {image_std}")
-    print("            (these come from config.ini and must match the training run "
-          "that produced this checkpoint)\n")
+    print(f"Preproc:    {input_preprocessing}\n")
 
-    loader = build_loader(args.dataset_dir, label_divisor, args.split, train_val_split, num_workers)
+    loader = build_loader(args.dataset_dir, label_divisor, args.split, train_val_split, num_workers,
+                          input_preprocessing)
     cached = cache_predictions(model, loader, device)
 
     n_gt = sum(len(e["gt_labels"]) for e in cached)

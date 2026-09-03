@@ -7,6 +7,70 @@ from torch.utils.data import Dataset
 import numpy as np
 
 
+DEFAULT_PREPROCESS_RANGES = {
+    0: (0.0, 255.0),
+    1: (0.0, 255.0),
+    2: (0.0, 255.0),
+    3: (0.0, 30.0),
+    4: (0.0, 1.0),
+    5: (0.0, 1.5),
+    6: (0.0, 1.0),
+    7: (-0.1, 0.5),
+}
+
+
+def process_image_for_model(img, mode="native", rgb_divisor=255.0, channel_ranges=None):
+    """Convert a stacked raster array to the format expected by the model.
+
+    mode="native" keeps the project's current behavior: RGB values are rescaled to
+    [0, 1] when they arrive as uint8-like imagery, while the extra bands are left
+    in their physical scale and are normalized later by the model transform through
+    `image_mean` / `image_std`.
+
+    mode="scaled_uint8" mimics the alternate project approach: each band is clipped
+    to a physically meaningful range, mapped into 0..255, then divided by 255 so the
+    model sees a standardized [0,1] image. This is a comparison mode for ablations;
+    it is not the default because the project's native normalization is designed to
+    preserve the actual spectral distribution and then apply measured stats.
+
+    Some source rasters (e.g. the vegetation-index mosaics under data/tiff/new)
+    have real gaps in flight coverage that were left as GDAL's float32 nodata
+    sentinel (~-3.4e38) instead of NaN, so `np.isfinite` doesn't catch them. Left
+    alone, that sentinel reaches the model transform's `(x - mean) / std` and
+    produces an activation on the order of 1e38, which is inf/NaN by the time it
+    reaches the first conv layer. Zero it out here, before either preprocessing
+    branch, same as an untextured/no-data pixel.
+    """
+    arr = np.asarray(img, dtype=np.float32, copy=True)
+    if arr.ndim == 2:
+        arr = arr[None, :, :]
+
+    bad = ~np.isfinite(arr) | (np.abs(arr) > 1e6)
+    if bad.any():
+        arr[bad] = 0.0
+
+    if mode == "native":
+        if arr.max() > 1.0 and arr.max() <= 255.0:
+            if arr.shape[0] >= 3:
+                arr[:3] = arr[:3] / rgb_divisor
+            else:
+                arr = arr / rgb_divisor
+        return arr
+
+    if mode == "scaled_uint8":
+        if channel_ranges is None:
+            channel_ranges = DEFAULT_PREPROCESS_RANGES
+        for idx in range(arr.shape[0]):
+            lo, hi = channel_ranges.get(idx, (0.0, 1.0))
+            if hi <= lo:
+                continue
+            arr[idx] = np.clip(arr[idx], lo, hi)
+            arr[idx] = (arr[idx] - lo) / (hi - lo)
+        return arr
+
+    raise ValueError(f"Unsupported image preprocessing mode: {mode!r}. Use 'native' or 'scaled_uint8'.")
+
+
 class TrainAugmentation:
     """Geometric + photometric augmentation for multi-channel UAV tiles.
 
@@ -119,7 +183,7 @@ class StackedImageInstanceMaskDataset(Dataset):
         - 'image_id': Int64Tensor [1] with image index
     """
     def __init__(self, image_paths, mask_paths, transforms=None, image_norm=True, drop_alpha=False,
-                 label_divisor=10000):
+                 label_divisor=10000, input_mode="native", channel_ranges=None):
         assert len(image_paths) == len(mask_paths)
         self.image_paths = image_paths
         self.mask_paths = mask_paths
@@ -127,6 +191,8 @@ class StackedImageInstanceMaskDataset(Dataset):
         self.image_norm = image_norm
         self.drop_alpha = drop_alpha
         self.label_divisor = label_divisor
+        self.input_mode = input_mode
+        self.channel_ranges = channel_ranges or DEFAULT_PREPROCESS_RANGES
 
     def __len__(self):
         return len(self.image_paths)
@@ -141,13 +207,12 @@ class StackedImageInstanceMaskDataset(Dataset):
         if self.drop_alpha and img.shape[0] >= 4:
             img = np.delete(img, 3, axis=0)
         if self.image_norm:
-            # Normalize first 3 bands if they look like uint8 RGB imagery.
-            if img.dtype == np.float32:
-                if img.max() > 1.0 and img.max() <= 255.0:
-                    if img.shape[0] >= 3:
-                        img[:3] = img[:3] / 255.0
-                    else:
-                        img = img / 255.0
+            img = process_image_for_model(
+                img,
+                mode=self.input_mode,
+                rgb_divisor=255.0,
+                channel_ranges=self.channel_ranges,
+            )
         image_tensor = torch.from_numpy(img)
 
         # Read the single-channel mask (uint16 or uint8)

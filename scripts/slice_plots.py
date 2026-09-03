@@ -9,7 +9,7 @@ import configparser
 
 
 config = configparser.ConfigParser()
-config_path = os.path.join("config.ini")
+config_path = os.environ.get("MASKRCNN_CONFIG", "config.ini")
 config.read(config_path)
 
 log_level = getattr(logging, config.get('SLICING', 'log_level', fallback='INFO'))

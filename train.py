@@ -32,7 +32,20 @@ except Exception:
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-logging.basicConfig(level=logging.INFO, filename = "train_20260830.log" ,format='%(asctime)s - %(levelname)s - %(message)s')
+# Log file comes from [TRAIN] log_file so parallel experiments (e.g. the band
+# ablation) each keep their own log instead of interleaving into one. Read here,
+# at import time, because basicConfig only takes effect on the first call.
+def _log_filename():
+    try:
+        _cfg = configparser.ConfigParser()
+        _cfg.read(os.environ.get("MASKRCNN_CONFIG", "config.ini"))
+        return _cfg.get("TRAIN", "log_file", fallback="train_20260830.log").strip() or "train_20260830.log"
+    except Exception:
+        return "train_20260830.log"
+
+
+logging.basicConfig(level=logging.INFO, filename=_log_filename(),
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Note: For debugging CUDA errors, run training with:
@@ -43,6 +56,24 @@ logger = logging.getLogger("Train_MaskRCNN")
 # =====================================================================
 # 1. DYNAMIC CHANNEL MASK R-CNN MODEL BUILDER
 # =====================================================================
+
+def get_image_preprocessing_mode(config):
+    """Return the image preprocessing mode used during training.
+
+    The current project default is 'native', which keeps physical band values and
+    lets the model normalization use measured per-channel stats. The alternate
+    'scaled_uint8' mode resizes each band to a physical range and converts it to
+    [0, 1] before the network sees it, matching the other repo's raster prep.
+    """
+    mode = config.get("TRAIN", "input_preprocessing", fallback="native").strip().lower()
+    if mode in ("", "native"):
+        return "native"
+    if mode in ("scaled", "scaled_uint8", "uint8_scaled"):
+        return "scaled_uint8"
+    raise ValueError(
+        f"Unsupported TRAIN.input_preprocessing={mode!r}. Use 'native' or 'scaled_uint8'."
+    )
+
 
 def get_multiband_maskrcnn(num_classes, in_channels=5, anchor_sizes=None, anchor_aspect_ratios=None,
                            image_mean=None, image_std=None, extra_channel_scale=None):
@@ -416,6 +447,67 @@ def compute_class_prf(predictions, targets, score_threshold=0.5, iou_threshold=0
     return metrics
 
 
+def compute_class_counts(predictions, targets, score_threshold=0.5, iou_threshold=0.5, num_classes=5):
+    """Per-class tp/fp/fn for one batch, for accumulating over a whole split.
+
+    `compute_class_prf` divides inside each batch, which cannot be re-averaged:
+    with one tile per batch a class holding a single crown scores 1.0 or 0.0, and
+    the mean over tiles then weights a sparse tile as heavily as a dense one.
+    Pooling these counts and dividing once at the end is the comparable statistic
+    (and is what scripts/evaluate_test_set.py reports).
+    """
+    counts = {c: [0, 0, 0] for c in range(1, num_classes)}
+    for pred, target in zip(predictions or [], targets or []):
+        p_labels = pred.get("labels", torch.empty(0, dtype=torch.int64))
+        p_boxes = pred.get("boxes", torch.empty((0, 4), dtype=torch.float32))
+        p_scores = pred.get("scores", torch.empty(0, dtype=torch.float32))
+        g_labels = target.get("labels", torch.empty(0, dtype=torch.int64))
+        g_boxes = target.get("boxes", torch.empty((0, 4), dtype=torch.float32))
+
+        keep = p_scores >= score_threshold
+        if keep.any():
+            order = torch.argsort(p_scores[keep], descending=True)
+            kept_boxes = p_boxes[keep][order].tolist()
+            kept_labels = p_labels[keep][order].tolist()
+        else:
+            kept_boxes, kept_labels = [], []
+
+        for cls_id in range(1, num_classes):
+            gt = [b for b, l in zip(g_boxes.tolist(), g_labels.tolist()) if int(l) == cls_id]
+            pr = [b for b, l in zip(kept_boxes, kept_labels) if int(l) == cls_id]
+            if not gt and not pr:
+                continue
+            used = [False] * len(gt)
+            matched = 0
+            for pb in pr:
+                best_iou, best = 0.0, None
+                for gi, gb in enumerate(gt):
+                    if used[gi]:
+                        continue
+                    iou = compute_iou(pb, gb)
+                    if iou > best_iou:
+                        best_iou, best = iou, gi
+                if best is not None and best_iou >= iou_threshold:
+                    used[best] = True
+                    matched += 1
+            counts[cls_id][0] += matched
+            counts[cls_id][1] += len(pr) - matched
+            counts[cls_id][2] += sum(1 for u in used if not u)
+    return counts
+
+
+def pooled_prf_from_counts(counts):
+    """Precision/recall/F1 computed once over pooled tp/fp/fn."""
+    tp = sum(v[0] for v in counts.values())
+    fp = sum(v[1] for v in counts.values())
+    fn = sum(v[2] for v in counts.values())
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    return {"pooled_precision": precision, "pooled_recall": recall, "pooled_f1": f1,
+            "pooled_tp": tp, "pooled_fp": fp, "pooled_fn": fn}
+
+
 def compute_global_pr_metrics(predictions, targets, score_threshold=0.5, iou_threshold=0.5, num_classes=None):
     """Compute macro mean precision and recall over the classes present in this batch.
 
@@ -507,6 +599,155 @@ def save_confusion_matrix(confusion_matrix, path):
     fig.tight_layout()
     fig.savefig(heatmap_path, dpi=200)
     plt.close(fig)
+
+
+def compute_detection_metrics(predictions, targets, score_threshold=0.5, iou_threshold=0.5):
+    """Compute detection-only metrics (ignoring class labels).
+    
+    Answers: "Did we find the tree?" regardless of whether we got the health class right.
+    Returns: {tp, fp, fn, precision, recall, f1} pooled over all classes.
+    """
+    gt_boxes = []
+    for target in targets or []:
+        boxes = target.get("boxes", torch.empty((0, 4), dtype=torch.float32))
+        gt_boxes.extend(boxes.tolist())
+
+    pred_boxes = []
+    pred_scores = []
+    for pred in predictions or []:
+        boxes = pred.get("boxes", torch.empty((0, 4), dtype=torch.float32))
+        scores = pred.get("scores", torch.empty(0, dtype=torch.float32))
+        keep = scores >= score_threshold
+        if keep.any():
+            pred_boxes.extend(boxes[keep].tolist())
+            pred_scores.extend(scores[keep].tolist())
+
+    if len(pred_boxes) == 0 and len(gt_boxes) == 0:
+        return {"tp": 0, "fp": 0, "fn": 0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
+
+    # Greedy matching by score
+    order = sorted(range(len(pred_boxes)), key=lambda idx: pred_scores[idx], reverse=True)
+    gt_used = [False] * len(gt_boxes)
+    matched = 0
+
+    for pred_idx in order:
+        best_match = None
+        best_iou = 0.0
+        for gt_idx, gt_box in enumerate(gt_boxes):
+            if gt_used[gt_idx]:
+                continue
+            iou = compute_iou(pred_boxes[pred_idx], gt_box)
+            if iou > best_iou:
+                best_iou = iou
+                best_match = gt_idx
+        if best_match is not None and best_iou >= iou_threshold:
+            gt_used[best_match] = True
+            matched += 1
+
+    tp = matched
+    fp = len(pred_boxes) - matched
+    fn = sum(1 for used in gt_used if not used)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    return {"tp": tp, "fp": fp, "fn": fn, "precision": precision, "recall": recall, "f1": f1}
+
+
+def compute_grading_metrics_on_detections(predictions, targets, score_threshold=0.5, iou_threshold=0.5, num_classes=5):
+    """Compute per-class metrics ONLY on matched detections (not on missed trees).
+    
+    Answers: "On the trees we found, how well did we classify their health?"
+    Returns: Per-class precision/recall/F1 computed only on true positives.
+    This isolates classification quality from detection quality.
+    """
+    # First, find all matched detections (detection TP)
+    matched_pairs = []  # [(pred_idx, gt_idx, pred_class, true_class), ...]
+    
+    for pred_idx, pred in enumerate(predictions or []):
+        p_labels = pred.get("labels", torch.empty(0, dtype=torch.int64))
+        p_boxes = pred.get("boxes", torch.empty((0, 4), dtype=torch.float32))
+        p_scores = pred.get("scores", torch.empty(0, dtype=torch.float32))
+
+        for p_label_idx, (p_label, p_box, p_score) in enumerate(zip(p_labels, p_boxes, p_scores)):
+            if float(p_score) < score_threshold:
+                continue
+
+            p_label = int(p_label.item())
+
+            # Find best matching GT
+            best_gt_idx = None
+            best_iou = 0.0
+            for target_idx, target in enumerate(targets or []):
+                g_labels = target.get("labels", torch.empty(0, dtype=torch.int64))
+                g_boxes = target.get("boxes", torch.empty((0, 4), dtype=torch.float32))
+
+                for g_label_idx, (g_label, g_box) in enumerate(zip(g_labels, g_boxes)):
+                    # Skip if already matched
+                    if any(m[1] == (target_idx, g_label_idx) for m in matched_pairs):
+                        continue
+
+                    iou = compute_iou(p_box.tolist(), g_box.tolist())
+                    if iou > best_iou and iou >= iou_threshold:
+                        best_iou = iou
+                        best_gt_idx = (target_idx, g_label_idx)
+
+            if best_gt_idx is not None:
+                g_target_idx, g_label_idx = best_gt_idx
+                true_class = int(targets[g_target_idx]["labels"][g_label_idx].item())
+                matched_pairs.append((pred_idx, best_gt_idx, p_label, true_class))
+
+    # Compute per-class accuracy on matched detections only
+    metrics = {}
+    for cls_id in range(1, num_classes):
+        # Among matched detections, how many did we get the class right?
+        correct = sum(1 for _, _, pred_cls, true_cls in matched_pairs if pred_cls == cls_id and true_cls == cls_id)
+        predicted = sum(1 for _, _, pred_cls, _ in matched_pairs if pred_cls == cls_id)
+        actual = sum(1 for _, _, _, true_cls in matched_pairs if true_cls == cls_id)
+
+        if predicted == 0 and actual == 0:
+            continue  # Class not present in matched detections
+
+        precision = correct / predicted if predicted > 0 else 0.0
+        recall = correct / actual if actual > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+        metrics[f"class_{cls_id}"] = {
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "correct": correct,
+            "predicted": predicted,
+            "actual": actual,
+        }
+
+    return metrics
+
+
+def compute_three_level_evaluation(predictions, targets, score_threshold=0.5, iou_threshold_strict=0.5, iou_threshold_loose=0.3, num_classes=5):
+    """Three-level evaluation (alternate project methodology).
+    
+    DETECTION: Did we find the tree? (IoU >= 0.5, ignoring class)
+    GRADING: On found trees, did we get the class right? (per-class accuracy on TP only)
+    COMPLETE: All trees counted, misses are errors (end-to-end pool metrics)
+    """
+    # Level 1: DETECTION (class-agnostic, strict IoU)
+    detection_metrics = compute_detection_metrics(predictions, targets, score_threshold, iou_threshold_strict)
+
+    # Level 2: GRADING (per-class accuracy on matched detections)
+    grading_metrics = compute_grading_metrics_on_detections(predictions, targets, score_threshold, iou_threshold_strict, num_classes)
+
+    # Level 3: COMPLETE (per-class end-to-end with loose matching for context)
+    # Uses standard compute_class_counts for complete evaluation
+    complete_metrics = compute_class_counts(predictions, targets, score_threshold, iou_threshold_strict, num_classes)
+    complete_prf = pooled_prf_from_counts(complete_metrics)
+
+    return {
+        "detection": detection_metrics,  # {tp, fp, fn, precision, recall, f1}
+        "grading": grading_metrics,       # {class_N: {precision, recall, f1, ...}}
+        "complete": complete_prf,         # {pooled_precision, pooled_recall, pooled_f1, ...}
+    }
 
 
 def save_final_metrics_summary(metrics_history, metrics_dir, logger_obj, best_epoch=None):
@@ -768,7 +1009,9 @@ def main(config):
 
     # Per-channel input normalization. Without these, extra bands fall back to
     # 0.5/0.5, which is wrong for anything not already in [0, 1] (e.g. CHM in
-    # metres). See scripts/compute_channel_stats.py.
+    # metres). See scripts/compute_channel_stats.py. This is only used for the
+    # project's native preprocessing mode; the alternate scaled_uint8 mode uses
+    # the preprocessing helper in dataset/multi_channel_dataset.py instead.
     image_mean_raw = config.get("TRAIN", "image_mean", fallback="").strip()
     image_mean = [float(v) for v in image_mean_raw.split(",") if v.strip()] or None
     image_std_raw = config.get("TRAIN", "image_std", fallback="").strip()
@@ -776,11 +1019,56 @@ def main(config):
     if image_mean and image_std:
         logger.info(f"Using measured per-channel normalization | mean={image_mean} std={image_std}")
     else:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
         logger.warning(
             "No image_mean/image_std in config; falling back to 0.5/0.5 for non-RGB channels. "
             "This is wrong for bands outside [0, 1] such as CHM - run "
             "scripts/compute_channel_stats.py and set them in config.ini."
         )
+
+    input_preprocessing = get_image_preprocessing_mode(config)
+    logger.info(f"Image preprocessing mode: {input_preprocessing}")
 
     # Initialize Model
     model = get_multiband_maskrcnn(
@@ -793,6 +1081,10 @@ def main(config):
     )
     # Move model to device after construction
     model.to(device)
+
+    # Read before the dataset branch so it is defined on every path, including the
+    # dummy-dataset fallback - the checkpoint records it as part of the architecture.
+    label_divisor = int(config.get("TRAIN", "mask_label_divisor", fallback="10000"))
 
     # Prepare dataset paths (expects slicer output with images/ and masks/ subfolders)
     dataset_dir = config.get("TRAIN", "dataset_dir", fallback="data/dataset_sliced_640")
@@ -850,12 +1142,21 @@ def main(config):
 
             logger.info(f"Train set: {len(train_image_paths)} samples | Validation set: {len(val_image_paths)} samples")
 
-            label_divisor = int(config.get("TRAIN", "mask_label_divisor", fallback="10000"))
             train_augmentation = TrainAugmentation() if TrainAugmentation is not None else None
-            dataset = StackedDataset(train_image_paths, train_mask_paths, transforms=train_augmentation,
-                                     label_divisor=label_divisor)
+            dataset = StackedDataset(
+                train_image_paths,
+                train_mask_paths,
+                transforms=train_augmentation,
+                label_divisor=label_divisor,
+                input_mode=input_preprocessing,
+            )
             # No augmentation on validation: metrics must reflect the true data distribution.
-            val_dataset = StackedDataset(val_image_paths, val_mask_paths, label_divisor=label_divisor)
+            val_dataset = StackedDataset(
+                val_image_paths,
+                val_mask_paths,
+                label_divisor=label_divisor,
+                input_mode=input_preprocessing,
+            )
 
     # DataLoader
     batch_size = int(config.get("TRAIN", "batch_size", fallback="1"))
@@ -879,8 +1180,55 @@ def main(config):
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(metrics_dir, exist_ok=True)
 
+    checkpoint_monitor = config.get("TRAIN", "checkpoint_monitor", fallback="pooled_f1").strip()
+    if checkpoint_monitor not in ("pooled_f1", "val_loss"):
+        raise ValueError(f"checkpoint_monitor must be 'pooled_f1' or 'val_loss', got {checkpoint_monitor!r}")
+    logger.info(f"Selecting checkpoints and early stopping on: {checkpoint_monitor}")
+
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
+
+    # Learning-rate schedule, stepped once per epoch.
+    #
+    # Warmup ramps the LR up over the first epochs, easing the large gradients the
+    # randomly-initialized heads produce against a pretrained backbone. Decay then
+    # shrinks the step size so the model can settle into the minimum instead of
+    # bouncing around it - which is what a constant LR was doing here, with val_loss
+    # bottoming out around epoch 5-16 and climbing afterwards.
+    warmup_epochs = int(config.get("TRAIN", "warmup_epochs", fallback="0"))
+    warmup_start_factor = float(config.get("TRAIN", "warmup_start_factor", fallback="0.1"))
+    lr_schedule = config.get("TRAIN", "lr_schedule", fallback="none").strip().lower()
+    lr_min_factor = float(config.get("TRAIN", "lr_min_factor", fallback="0.01"))
+
+    phases, milestones = [], []
+    if warmup_epochs > 0:
+        phases.append(torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=max(1e-8, warmup_start_factor), end_factor=1.0,
+            total_iters=warmup_epochs))
+        milestones.append(warmup_epochs)
+    decay_epochs = max(1, num_epochs - warmup_epochs)
+    if lr_schedule == "cosine":
+        phases.append(torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=decay_epochs, eta_min=learning_rate * lr_min_factor))
+    elif lr_schedule == "step":
+        phases.append(torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=max(1, decay_epochs // 3), gamma=0.1))
+    elif lr_schedule not in ("none", ""):
+        raise ValueError(f"lr_schedule must be 'none', 'cosine' or 'step', got {lr_schedule!r}")
+    elif warmup_epochs > 0:
+        # Warmup with no decay: hold the target LR for the rest of the run.
+        phases.append(torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0,
+                                                          total_iters=decay_epochs))
+
+    if len(phases) > 1:
+        scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, phases, milestones=milestones)
+    elif phases:
+        scheduler = phases[0]
+    else:
+        scheduler = None
+    logger.info(f"LR schedule: warmup_epochs={warmup_epochs} "
+                f"(start_factor={warmup_start_factor}) | decay={lr_schedule} "
+                f"| base_lr={learning_rate} min_lr={learning_rate * lr_min_factor:.2e}")
 
     # AMP setup
     use_amp = config.getboolean("TRAIN", "amp", fallback=False)
@@ -936,6 +1284,15 @@ def main(config):
         epoch_confusion = np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=np.float64)
         epoch_class_pr = defaultdict(list)
         epoch_global_pr = {"mean_precision": [], "mean_recall": []}
+        # tp/fp/fn pooled over the whole split - the statistic used for checkpoint
+        # selection, and the one comparable to scripts/evaluate_test_set.py.
+        epoch_counts = {c: [0, 0, 0] for c in range(1, NUM_CLASSES)}
+        
+        # Track separated detection vs grading metrics
+        epoch_detection_tp = 0
+        epoch_detection_fp = 0
+        epoch_detection_fn = 0
+        epoch_grading_totals = {c: [0, 0, 0] for c in range(1, NUM_CLASSES)}  # [correct, predicted, actual]
 
         with torch.no_grad():
             for val_batch_idx, (val_images, val_targets) in enumerate(val_loader, 1):
@@ -993,6 +1350,30 @@ def main(config):
                     if global_metrics:
                         epoch_global_pr["mean_precision"].append(global_metrics["mean_precision"])
                         epoch_global_pr["mean_recall"].append(global_metrics["mean_recall"])
+
+                    batch_counts = compute_class_counts(
+                        val_predictions, val_targets, score_threshold=0.5,
+                        iou_threshold=iou_threshold, num_classes=NUM_CLASSES)
+                    for cls_id, (tp, fp, fn) in batch_counts.items():
+                        epoch_counts[cls_id][0] += tp
+                        epoch_counts[cls_id][1] += fp
+                        epoch_counts[cls_id][2] += fn
+                    
+                    # Accumulate separated detection and grading metrics
+                    batch_detection = compute_detection_metrics(
+                        val_predictions, val_targets, score_threshold=0.5, iou_threshold=iou_threshold)
+                    epoch_detection_tp += batch_detection.get('tp', 0)
+                    epoch_detection_fp += batch_detection.get('fp', 0)
+                    epoch_detection_fn += batch_detection.get('fn', 0)
+                    
+                    batch_grading = compute_grading_metrics_on_detections(
+                        val_predictions, val_targets, score_threshold=0.5,
+                        iou_threshold=iou_threshold, num_classes=NUM_CLASSES)
+                    for cls_id, metrics in batch_grading.items():
+                        epoch_grading_totals[int(cls_id.split('_')[1])][0] += metrics.get('correct', 0)
+                        epoch_grading_totals[int(cls_id.split('_')[1])][1] += metrics.get('predicted', 0)
+                        epoch_grading_totals[int(cls_id.split('_')[1])][2] += metrics.get('actual', 0)
+                    
                     log_metrics(logger, "Validation", epoch, {**metrics, **global_metrics}, val_batch_idx, len(val_loader))
                     logger.info(f"Epoch [{epoch + 1}/{num_epochs}] Validation Confusion Matrix (rows=true, cols=pred): {confusion.tolist()}")
 
@@ -1021,19 +1402,60 @@ def main(config):
             "mean_precision": float(np.mean(epoch_global_pr["mean_precision"])) if epoch_global_pr["mean_precision"] else 0.0,
             "mean_recall": float(np.mean(epoch_global_pr["mean_recall"])) if epoch_global_pr["mean_recall"] else 0.0,
             "epoch_confusion": epoch_confusion.copy(),
+            **pooled_prf_from_counts(epoch_counts),
         }
+        logger.info(
+            f"Epoch [{epoch + 1}/{num_epochs}] Pooled over val: "
+            f"precision={epoch_summary['pooled_precision']:.4f} "
+            f"recall={epoch_summary['pooled_recall']:.4f} "
+            f"F1={epoch_summary['pooled_f1']:.4f} "
+            f"(tp={epoch_summary['pooled_tp']} fp={epoch_summary['pooled_fp']} "
+            f"fn={epoch_summary['pooled_fn']}) | lr={optimizer.param_groups[0]['lr']:.2e}"
+        )
+
+        # Log separated detection (localization) vs grading (classification) metrics
+        if epoch_detection_tp + epoch_detection_fp + epoch_detection_fn > 0:
+            detection_precision = epoch_detection_tp / (epoch_detection_tp + epoch_detection_fp) if (epoch_detection_tp + epoch_detection_fp) > 0 else 0.0
+            detection_recall = epoch_detection_tp / (epoch_detection_tp + epoch_detection_fn) if (epoch_detection_tp + epoch_detection_fn) > 0 else 0.0
+            detection_f1 = 2 * detection_precision * detection_recall / (detection_precision + detection_recall) if (detection_precision + detection_recall) > 0 else 0.0
+            logger.info(
+                f"Epoch [{epoch + 1}/{num_epochs}] DETECTION (class-agnostic): "
+                f"TP={epoch_detection_tp} FP={epoch_detection_fp} FN={epoch_detection_fn} | "
+                f"Precision={detection_precision:.4f} Recall={detection_recall:.4f} F1={detection_f1:.4f}"
+            )
+
+        # Log per-class grading (classification accuracy on detected trees only)
+        if any(v[1] > 0 for v in epoch_grading_totals.values()):  # if any class was predicted
+            grading_precisions = []
+            for cls_id in range(1, NUM_CLASSES):
+                correct, predicted, actual = epoch_grading_totals[cls_id]
+                if predicted > 0 or actual > 0:
+                    precision = correct / predicted if predicted > 0 else 0.0
+                    grading_precisions.append(precision)
+            if grading_precisions:
+                logger.info(
+                    f"Epoch [{epoch + 1}/{num_epochs}] GRADING (on detected trees): "
+                    f"Macro Precision={np.mean(grading_precisions):.4f} "
+                    f"(correct classifications out of found trees)"
+                )
 
         for key, values in epoch_class_pr.items():
             epoch_summary[key] = float(np.mean(values)) if values else 0.0
 
-        if np.isfinite(val_loss):
+        # Selecting on val_loss repeatedly saved a barely-trained model: it bottoms
+        # out at epoch 5-16 and rises while detection quality is still improving, so
+        # the 20-30 epochs after it were discarded unmeasured. pooled_f1 selects on
+        # what the model is actually for. Both checkpointing and early stopping use
+        # the same monitor so they cannot disagree.
+        if checkpoint_monitor == "val_loss" or not np.isfinite(val_loss):
             monitor_name = "val_loss"
             monitor_value = val_loss
             improved = best_monitor is None or monitor_value < best_monitor
+            if not np.isfinite(val_loss):
+                monitor_name = "val_loss(non-finite)"
         else:
-            f1_values = [value for key, value in epoch_summary.items() if key.endswith("_f1")]
-            monitor_name = "mean_f1"
-            monitor_value = float(np.mean(f1_values)) if f1_values else 0.0
+            monitor_name = "pooled_f1"
+            monitor_value = epoch_summary["pooled_f1"]
             improved = best_monitor is None or monitor_value > best_monitor
 
         if improved:
@@ -1048,6 +1470,11 @@ def main(config):
             f"no improvement for {epochs_without_improvement}/{early_stopping_patience} epochs"
         )
 
+        # Stepped after validation, so the LR logged above is the one this epoch
+        # actually trained with.
+        if scheduler is not None:
+            scheduler.step()
+
         metrics_history.append(epoch_summary)
 
         # Save checkpoint (best model only)
@@ -1061,6 +1488,21 @@ def main(config):
                 'val_loss': val_loss,
                 'learning_rate': learning_rate,
                 'weight_decay': weight_decay,
+                # Everything needed to rebuild this exact architecture. Anchors and
+                # normalization are NOT recoverable from the state_dict - anchors only
+                # surface as an RPN head shape mismatch, and normalization lives in the
+                # model's transform, so loading under the wrong values silently returns
+                # nonsense. Scripts that reload a checkpoint should read these rather
+                # than trusting whatever config.ini happens to say now.
+                'arch': {
+                    'num_classes': NUM_CLASSES,
+                    'in_channels': NUM_INPUT_CHANNELS,
+                    'anchor_sizes': anchor_sizes,
+                    'anchor_aspect_ratios': anchor_aspect_ratios,
+                    'image_mean': image_mean,
+                    'image_std': image_std,
+                    'mask_label_divisor': label_divisor,
+                },
             }, checkpoint_path)
             logger.info(f"Saved BEST checkpoint to: {checkpoint_path}")
 
@@ -1097,7 +1539,8 @@ def main(config):
 
 if __name__ == "__main__":
     config = configparser.ConfigParser()
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
+    config_path = os.environ.get("MASKRCNN_CONFIG") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "config.ini")
     config.read(config_path)
     logger.setLevel(getattr(logging, config.get('TRAIN', 'log_level', fallback='INFO')))
     try:

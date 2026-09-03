@@ -258,16 +258,15 @@ def generate_class_mask_geotiff(plot_tif_path, trees_gdf, output_mask_dir, class
         for _, row in intersecting_trees.iterrows():
             geom = row.geometry
             if not geom.is_empty and geom.area > 0:
-                # Get the class ID from the tree_class property and add 1
-                # (tree_class values 0-3 become 1-4, background is 0)
+                # No longer need to add 1
                 try:
-                    class_id = int(row.get(class_property, 0)) + 1
+                    class_id = int(row.get(class_property, 0))
                 except (ValueError, TypeError):
                     logger.warning(f"Invalid class value for tree, using 0")
                     class_id = 0
                 
                 shapes.append((geom, class_id))
-                class_counts[class_id] = class_counts.get(class_id, 0) + 1
+                class_counts[class_id] = class_counts.get(class_id, 0)
 
         if len(shapes) > 0:
             class_mask = rasterize(

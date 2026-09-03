@@ -225,3 +225,5 @@ backup_run_*/
 *.pth
 train.log
 utils.log
+*.log
+checkpoints*/

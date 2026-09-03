@@ -92,7 +92,7 @@ if __name__ == "__main__":
 
     # Load configuration settings
     config = configparser.ConfigParser()
-    config_path = "config.ini"
+    config_path = os.environ.get("MASKRCNN_CONFIG", "config.ini")
     config.read(config_path)
 
     logger.info(f"Starting plot cropping process ...")

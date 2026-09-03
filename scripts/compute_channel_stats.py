@@ -78,9 +78,13 @@ def main():
         if args.rgb_divisor != 1.0 and n_bands >= 3:
             arr[:3] /= args.rgb_divisor
         flat = arr.reshape(n_bands, -1)
-        finite = np.isfinite(flat)
-        if not finite.all():
-            flat = np.where(finite, flat, 0.0)
+        # Some source mosaics leave real gaps in flight coverage as GDAL's float32
+        # nodata sentinel (~-3.4e38) instead of NaN, so isfinite alone won't catch
+        # them - matches the sanitization in process_image_for_model, so these
+        # stats describe what the model actually sees.
+        valid = np.isfinite(flat) & (np.abs(flat) <= 1e6)
+        if not valid.all():
+            flat = np.where(valid, flat, 0.0)
         total += flat.sum(axis=1)
         total_sq += (flat ** 2).sum(axis=1)
         count += flat.shape[1]

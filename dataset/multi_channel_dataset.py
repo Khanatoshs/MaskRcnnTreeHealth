@@ -7,6 +7,10 @@ from torch.utils.data import Dataset
 import numpy as np
 
 
+# Per-channel clip ranges for mode="scaled_uint8", in band order
+# (R, G, B, CHM, NDVI, CIRE, GNDVI, NDRE, [EL, INTENSITY]).
+# A channel with no entry here falls back to (0.0, 1.0), which silently flattens any
+# band whose real range is larger - so every band that exists must be listed.
 DEFAULT_PREPROCESS_RANGES = {
     0: (0.0, 255.0),
     1: (0.0, 255.0),
@@ -16,6 +20,12 @@ DEFAULT_PREPROCESS_RANGES = {
     5: (0.0, 1.5),
     6: (0.0, 1.0),
     7: (-0.1, 0.5),
+    # Bands 9-10, present only in the 10-channel datasets (see [MULTICHANNEL]
+    # extra_band_paths). EL is a Byte-quantised elevation grid (measured 11-241 over
+    # the 0904 plots, nodata=255), so its physical range is the full Byte range;
+    # INTENSITY is LiDAR return intensity (measured 0-158 over the same plots).
+    8: (0.0, 255.0),
+    9: (0.0, 160.0),
 }
 
 
@@ -50,7 +60,15 @@ def process_image_for_model(img, mode="native", rgb_divisor=255.0, channel_range
         arr[bad] = 0.0
 
     if mode == "native":
-        if arr.max() > 1.0 and arr.max() <= 255.0:
+        # Decide the RGB rescale from the RGB bands themselves, not from the global
+        # max across every band. Gating on the global max means one non-RGB band
+        # exceeding 255 (LiDAR intensity can, and Int16 bands generally can) flips
+        # this test off and silently leaves RGB in 0-255 while image_mean/image_std
+        # expect 0-1 - a per-tile, data-dependent mis-normalization that raises no
+        # error. With the 8-band stack the two are equivalent (RGB dominates), so
+        # this changes nothing for the existing datasets.
+        rgb_max = arr[:3].max() if arr.shape[0] >= 3 else arr.max()
+        if rgb_max > 1.0 and rgb_max <= 255.0:
             if arr.shape[0] >= 3:
                 arr[:3] = arr[:3] / rgb_divisor
             else:

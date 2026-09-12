@@ -64,7 +64,7 @@ def create_stacked_vrt(input_raster_list, output_vrt_path):
 if __name__ == "__main__":
 
     config = configparser.ConfigParser()
-    config.read("config.ini")
+    config.read(os.environ.get("MASKRCNN_CONFIG", "config.ini"))
     logger.info("Starting VRT creation process based on configuration settings...")
     output_dir = config.get("MULTICHANNEL", "output_dir")
     rgb_path = config.get("MULTICHANNEL", "rgb_img_path")
@@ -92,6 +92,22 @@ if __name__ == "__main__":
         config.get("MULTICHANNEL", "gndvi_img_path"),  # Band 7 (GNDVI)
         config.get("MULTICHANNEL", "ndre_img_path"),   # Band 8 (NDRE)
     ]
+
+    # Optional additional source rasters, appended in the order given as bands 9, 10, ...
+    # Kept strictly *after* the eight fixed bands so band 4 stays CHM - [MASKS] CHM_BAND
+    # and the per-channel image_mean/image_std ordering both depend on that. Anything
+    # GDAL can open works here, including ESRI ArcInfo binary grid directories (the
+    # elevation/intensity layers are supplied in that format). Absent or blank => the
+    # usual 8-band stack, so existing configs are unaffected.
+    extra_paths = [p.strip() for p in
+                   config.get("MULTICHANNEL", "extra_band_paths", fallback="").split(",")
+                   if p.strip()]
+    for offset, extra in enumerate(extra_paths, start=len(input_rasters) + 1):
+        if not os.path.exists(extra):
+            raise SystemExit(f"[MULTICHANNEL] extra_band_paths entry not found: {extra}")
+        logger.info(f"Adding extra source as band {offset}: {extra}")
+        input_rasters.append(extra)
+    logger.info(f"Stacking {len(input_rasters)} bands total")
 
     output_path = os.path.join(config.get("MULTICHANNEL","output_dir"),
                               config.get("MULTICHANNEL","output_name") + ".vrt") 

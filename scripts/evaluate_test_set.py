@@ -33,7 +33,16 @@ from train import (get_multiband_maskrcnn, get_image_preprocessing_mode, collate
                    compute_iou, plot_id_from_tile_path, split_paths_by_plot)
 from dataset.multi_channel_dataset import StackedImageInstanceMaskDataset
 
-CLASS_NAMES = {1: "healthy", 2: "mild", 3: "moderate", 4: "severe"}
+# Two annotation schemes coexist: the original 4-tier health scale (background + healthy/
+# mild/moderate/severe, num_classes=5) and, from data/new_data's 2026-09 annotation update
+# onward, a 3-tier scale with moderate dropped (background + healthy/mild/severe, num_classes=4).
+# Picked by class_names_for(num_classes) once the checkpoint's actual num_classes is known.
+CLASS_NAMES_4TIER = {1: "healthy", 2: "mild", 3: "moderate", 4: "severe"}
+CLASS_NAMES_3TIER = {1: "healthy", 2: "mild", 3: "severe"}
+
+
+def class_names_for(num_classes):
+    return CLASS_NAMES_3TIER if num_classes <= 4 else CLASS_NAMES_4TIER
 
 
 def load_config():
@@ -292,6 +301,8 @@ def main():
                           if v.strip()] or None
             image_std = [float(v) for v in config.get("TRAIN", "image_std", fallback="").split(",")
                          if v.strip()] or None
+
+    CLASS_NAMES = class_names_for(num_classes)
 
     model = get_multiband_maskrcnn(num_classes=num_classes, in_channels=in_channels,
                                    anchor_sizes=anchor_sizes, anchor_aspect_ratios=anchor_ratios,

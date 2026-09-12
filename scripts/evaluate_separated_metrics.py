@@ -278,10 +278,16 @@ def main():
         for batch_idx, (images, targets) in enumerate(loader, 1):
             images = [img.to(device) for img in images]
             predictions = model([img for img in images])
-            
-            all_predictions.extend(predictions)
-            all_targets.extend(targets)
-            
+
+            # Move off GPU before accumulating - `predictions` (boxes/labels/scores/masks,
+            # the masks especially) stayed on GPU here and never got freed across the loop,
+            # so a noisier checkpoint (more raw detections per tile before score
+            # thresholding) could accumulate enough GPU memory over ~140 tiles to OOM.
+            # torch.cuda.empty_cache() below only returns *unreferenced* cached memory to
+            # the driver - it does nothing for tensors a live Python object still holds.
+            all_predictions.extend({k: v.cpu() for k, v in p.items()} for p in predictions)
+            all_targets.extend({k: v.cpu() for k, v in t.items()} for t in targets)
+
             # Clear GPU cache after each batch to prevent OOM
             if device.type == 'cuda':
                 torch.cuda.empty_cache()

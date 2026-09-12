@@ -46,9 +46,27 @@ from torch.utils.data import DataLoader
 # simulated protan/deutan vision: worst pair dE 11.6 (target >= 8) and 18.6 under
 # normal vision (floor 15). Every box is also labelled, so colour never carries the
 # class alone.
-CLASS_NAMES = {1: "healthy", 2: "mild", 3: "moderate", 4: "severe"}
+# Two annotation schemes coexist in this project: the original 4-tier health scale
+# (background + healthy/mild/moderate/severe, num_classes=5) and, from data/new_data's
+# 2026-09 annotation update onward, a 3-tier scale with moderate dropped (background +
+# healthy/mild/severe, num_classes=4). Colours are kept identical per class_id across
+# both - class 3 renders in the old "moderate" orange under the 3-tier scheme, since
+# color is keyed by class_id, not by semantic label.
+CLASS_NAMES_4TIER = {1: "healthy", 2: "mild", 3: "moderate", 4: "severe"}
+CLASS_NAMES_3TIER = {1: "healthy", 2: "mild", 3: "severe"}
 CLASS_COLORS = {1: "#00E5FF", 2: "#B14DFF", 3: "#FF8A00", 4: "#FF1744"}
+# Plain-language name of each class colour, so a legend can say "healthy (cyan)"
+# rather than relying on the reader matching a swatch by eye.
+CLASS_COLOR_NAMES = {1: "cyan", 2: "purple", 3: "orange", 4: "red"}
 UNMATCHED = "#FFFFFF"
+
+# Back-compat module-level default (4-tier); draw_boxes/overlay callers pass the
+# right one explicitly once num_classes is known - see class_names_for().
+CLASS_NAMES = CLASS_NAMES_4TIER
+
+
+def class_names_for(num_classes):
+    return CLASS_NAMES_3TIER if num_classes <= 4 else CLASS_NAMES_4TIER
 
 # Line style separates the match states; colour separates matched from unmatched.
 STYLE_OK = "solid"
@@ -100,21 +118,23 @@ def overlay_masks(ax, masks, labels, colors, alpha=0.30):
     ax.imshow(rgba, interpolation="nearest")
 
 
-def draw_boxes(ax, boxes, labels, statuses, scores=None):
+def draw_boxes(ax, boxes, labels, statuses, scores=None, class_names=None, class_colors=None):
     """statuses: 'ok' | 'missed' | 'fp' | 'wrong:<true_class>'.
 
     Labels are drawn as small stroked text rather than filled chips: a filled
     background on every box covered more of the tile than the boxes did, which
     defeats the point of looking at the imagery.
     """
+    class_names = CLASS_NAMES if class_names is None else class_names
+    class_colors = CLASS_COLORS if class_colors is None else class_colors
     stroke = [path_effects.withStroke(linewidth=2.0, foreground="#000000")]
     for i, (box, label) in enumerate(zip(boxes, labels)):
         x1, y1, x2, y2 = box
         status = statuses[i]
         if status == "ok":
-            edge, lw, ls = CLASS_COLORS.get(int(label), "#BBBBBB"), 1.7, STYLE_OK
+            edge, lw, ls = class_colors.get(int(label), "#BBBBBB"), 1.7, STYLE_OK
         elif status.startswith("wrong"):
-            edge, lw, ls = CLASS_COLORS.get(int(label), "#BBBBBB"), 2.0, STYLE_WRONG
+            edge, lw, ls = class_colors.get(int(label), "#BBBBBB"), 2.0, STYLE_WRONG
         else:  # missed or fp
             edge, lw, ls = UNMATCHED, 1.7, STYLE_UNMATCHED
 
@@ -123,11 +143,11 @@ def draw_boxes(ax, boxes, labels, statuses, scores=None):
         patch.set_path_effects(_halo(lw))
         ax.add_patch(patch)
 
-        text = CLASS_NAMES.get(int(label), str(label))
+        text = class_names.get(int(label), str(label))
         if scores is not None:
             text += f" {scores[i]:.2f}"
         if status.startswith("wrong"):
-            text += f" ←{CLASS_NAMES.get(int(status.split(':')[1]), '?')}"
+            text += f" ←{class_names.get(int(status.split(':')[1]), '?')}"
         elif status == "fp":
             text += " no GT"
         elif status == "missed":
@@ -230,6 +250,8 @@ def visualize_predictions(checkpoint, dataset_dir, out_path, num_tiles=10, split
             image_std = [float(v) for v in config.get("TRAIN", "image_std", fallback="").split(",")
                          if v.strip()] or None
 
+    names = class_names_for(num_classes)
+
     model = get_multiband_maskrcnn(num_classes=num_classes, in_channels=in_channels,
                                    anchor_sizes=anchor_sizes, anchor_aspect_ratios=anchor_ratios,
                                    image_mean=image_mean, image_std=image_std)
@@ -280,7 +302,7 @@ def visualize_predictions(checkpoint, dataset_dir, out_path, num_tiles=10, split
             ax = axes[row][0]
             ax.imshow(rgb)
             overlay_masks(ax, list(gm), gl, [CLASS_COLORS.get(int(l), "#888") for l in gl])
-            draw_boxes(ax, gb, gl, gt_status)
+            draw_boxes(ax, gb, gl, gt_status, class_names=names)
             n_missed = sum(1 for s in gt_status if s == "missed")
             ax.set_title(f"{tile}\nground truth — {len(gb)} crowns, {n_missed} not found",
                          fontsize=9, loc="left")
@@ -290,7 +312,7 @@ def visualize_predictions(checkpoint, dataset_dir, out_path, num_tiles=10, split
             if len(pm):
                 overlay_masks(ax, [(m > 0.5).astype(np.uint8) for m in pm], pl,
                               [CLASS_COLORS.get(int(l), "#888") for l in pl])
-            draw_boxes(ax, pb, pl, pred_status, scores=ps)
+            draw_boxes(ax, pb, pl, pred_status, scores=ps, class_names=names)
             n_fp = sum(1 for s in pred_status if s == "fp")
             n_wrong = sum(1 for s in pred_status if s.startswith("wrong"))
             ax.set_title(f"predictions @ score ≥ {score_threshold} — {len(pb)} boxes, "
@@ -301,8 +323,8 @@ def visualize_predictions(checkpoint, dataset_dir, out_path, num_tiles=10, split
                 for spine in a.spines.values():
                     spine.set_edgecolor("#CCCCCC")
 
-    handles = [Patch(facecolor=CLASS_COLORS[c], edgecolor="none", label=CLASS_NAMES[c])
-               for c in sorted(CLASS_NAMES)]
+    handles = [Patch(facecolor=CLASS_COLORS[c], edgecolor="none", label=names[c])
+               for c in sorted(names)]
     handles += [
         Line2D([0], [0], color="#444444", lw=2, ls=STYLE_UNMATCHED,
                label="unmatched — missed crown / false positive"),

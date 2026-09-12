@@ -244,3 +244,381 @@ detection and grading level, not just one of them.
 - Next step once more plots get new CHM clips: re-run `build_chm_updated_dataset.py`, and re-train
   both configs on the larger resulting set to see whether H's advantage over G holds up, or was
   mostly a small-sample effect.
+
+---
+
+# 2026-09-03 update: isolating preprocessing mode on the full new_data set (run I)
+
+Run F (scaled_uint8) was never matched by a native-preprocessing run on the *same* `data/new_data`
+tiles, so every earlier native-vs-scaled_uint8 read (F vs. A–E, or G vs. H) was confounded by
+either a different annotation set (F vs. A–E) or a much smaller 11-plot training set (G/H). This
+run closes that gap: **run I is run F's exact configuration — same 26 train / 6 test plots, same
+`data/new_data/dataset_sliced_800(_test)` tiles, same anchors, same architecture/schedule — with
+only `input_preprocessing` switched from `scaled_uint8` to `native`.** I vs. F is now the cleanest
+preprocessing-mode comparison in this file.
+
+Run F's own evaluation (pooled test-set metrics in `results/checkpoints_scaled_uint8/metrics/` and
+the detection/grading breakdown in `results/checkpoints_scaled_uint8/separated_metrics/`) was
+already complete and already reported above (the "Configurations"/pooled-results tables and the
+"Run F only: detection vs grading breakdown" section) — nothing new needed there, it's reused
+as-is for this comparison.
+
+## Configuration
+
+| Run | Checkpoint dir | Channels | Preprocessing | Dataset | Best epoch / trained |
+|---|---|---|---|---|---|
+| F | `results/checkpoints_scaled_uint8/` | 8 | scaled_uint8 | `data/new_data/dataset_sliced_800` | 33 / 63 |
+| I | `results/checkpoints_new_data/` | 8 | **native** | `data/new_data/dataset_sliced_800` | 14 / 44 |
+
+Config: [config_new_data_native.ini](config_new_data_native.ini) (frozen copy of the `config.ini`
+that was already staged for this run). Same anchors as F (`sizes=112,144,184,216,288`,
+`ratios=0.62,1.0,1.36`), same `batch_size=2`, `lr=1e-4` cosine, warmup 10 epochs, early stopping
+patience 30, checkpoint selection by highest `pooled_f1`. I's `image_mean`/`image_std` for the
+extra 5 bands were measured on `data/new_data` via `scripts/compute_channel_stats.py` (with the
+nodata-sentinel fix from the G/H update already in place — see that section above):
+`10.8663,0.5266,0.3391,0.5179,0.1435` / `8.3472,0.1108,0.0955,0.0751,0.0347` for
+CHM/NDVI/CIRE/GNDVI/NDRE (RGB stays ImageNet). I trained much faster than F did on the same data
+(~27 min for 44 epochs vs. F's ~8 hours for 63) — same GPU, same tile count; not investigated
+further since loss curves and val metrics both look normal, but worth knowing if reproducing.
+
+## Pooled test-set results — evaluation metrics (`evaluate_test_set.py`, score≥0.5, IoU≥0.5, same 96 tiles / 742 GT / 6 test plots for both runs)
+
+| Run | tp | fp | fn | Precision | Recall | F1 | AP50 | AR@100 |
+|---|---|---|---|---|---|---|---|---|
+| F (scaled_uint8) | 405 | 318 | 337 | 0.560 | 0.546 | 0.553 | 0.558 | 0.418 |
+| I (native) | 413 | 339 | 329 | 0.549 | 0.557 | **0.553** | 0.637 | 0.529 |
+
+Complete-task F1 is a dead heat (0.5529 vs. 0.5529 to 4 sig figs — F is 0.552901, I is 0.552878).
+I clearly wins on detection quality: AP50 0.637 vs. 0.558 and AR@100 0.529 vs. 0.418, both well
+above F. Pooled precision/recall trade off in opposite directions (F: higher precision, lower
+recall; I: lower precision, higher recall) and roughly cancel in F1.
+
+### Per-class F1 (pooled)
+
+| Run | healthy | mild | moderate | severe |
+|---|---|---|---|---|
+| F | n/a (no GT) | 0.596 (123/70/97) | 0.505 (143/148/132) | 0.572 (139/100/108) |
+| I | n/a (no GT) | 0.542 (97/41/123) | 0.522 (161/181/114) | 0.597 (155/117/92) |
+
+(tp/fp/fn in parentheses.) F grades `mild` better; I grades `severe` slightly better and
+`moderate` better; `mild` recall is I's weak point (0.441 vs. F's 0.559 — I's mild-class fn=123
+vs. F's 97).
+
+**Macro F1 note:** the "Macro F1" this project has been reporting (0.418 for F, computed the same
+way here) averages precision/recall/F1 across **all 4 classes**, scoring the absent `healthy`
+class as 0 rather than excluding it — despite the earlier footnote on F's row claiming a 3-class
+average. That footnote was wrong; the number itself (0.418) is the 4-class figure with a zero
+folded in, confirmed against `results/checkpoints_scaled_uint8/metrics/all_evaluation.json`'s
+`macro.f1`. I's equivalent 4-class figure is **0.415** (`results/checkpoints_new_data/metrics/all_evaluation.json`
+→ `macro.f1`), directly comparable to F's 0.418. The classification-only 3-class macro (excluding
+`healthy`, mild/moderate/severe only, matching how the per-class F1 row above should actually be
+averaged) is **0.554 for I** and **0.558 for F** — nearly identical, consistent with the pooled
+F1 tie.
+
+### Best F1 across the threshold sweep
+
+| Run | Best threshold | Best F1 (default-threshold F1) |
+|---|---|---|
+| F | 0.40 | 0.558 (0.553) |
+| I | 0.50 | 0.553 (0.553) |
+
+## Detection vs grading breakdown — classification metrics (`evaluate_separated_metrics.py`)
+
+Splits "did we find the tree" (class-agnostic detection) from "did we grade it right, given we
+found it" (classification only, scored on true positives). Both already-reported for F; I is new.
+
+| Level | F Precision | F Recall | F F1 | I Precision | I Recall | I F1 |
+|---|---|---|---|---|---|---|
+| Detection (class-agnostic, found it at all) | 0.859 | 0.771 | 0.813 | 0.831 | 0.842 | **0.837** |
+| Grading (health class, given detected — macro over mild/moderate/severe) | 0.509 | 0.506 | 0.507 | 0.514 | 0.502 | 0.503 |
+| Complete end-to-end (includes missed trees) | 0.572 | 0.514 | 0.541 | 0.549 | 0.557 | 0.553 |
+
+I's detection F1 (0.837) beats F's (0.813) — mainly recall (I: tp=625/fp=127/fn=117, R=0.842; F:
+tp=572/fp=94/fn=170, R=0.771 — native finds 53 more of the 742 GT trees, at the cost of 33 more
+detection false positives). Grading, given a correct detection, is a near-tie (0.503 vs. 0.507) —
+the health-class confusion (mild vs. moderate vs. severe on an already-detected crown) is
+essentially unaffected by preprocessing mode. The complete-task numbers land close (0.553 vs.
+0.541) because I's detection gain is partly offset by marginally weaker grading precision on those
+extra detections.
+
+Full outputs: `results/checkpoints_new_data/metrics/all_evaluation.json` (pooled) and
+`results/checkpoints_new_data/separated_metrics/separated_metrics_test.json` (detection/grading).
+
+## Takeaways
+
+- **On this dataset, native vs. scaled_uint8 makes almost no difference to complete-task F1**
+  (0.553 both ways) once the annotation set and training data are held fixed — the earlier F-vs-A/B
+  read (which looked like scaled_uint8 might help) and the G-vs-H read (scaled_uint8 clearly ahead)
+  were both confounded, by a different annotation set and a small 11-plot subset respectively. This
+  run is the first apples-to-apples test on the full 26-plot set, and it says preprocessing mode is
+  not the lever — contrast with the CHM-removal effect (run C) or plot-count effect (F/I vs. G/H),
+  both of which move F1 far more.
+- Native's edge is entirely on the detection side (AP50 0.637 vs. 0.558, AR@100 0.529 vs. 0.418,
+  detection-F1 0.837 vs. 0.813) — it finds more crowns, especially at looser IoU/recall operating
+  points. Grading accuracy given a detection is indistinguishable between modes (0.503 vs. 0.507).
+  If detection recall matters more than precision for the paper's use case, native is the better
+  default; if the two are equally weighted, either is defensible since complete-task F1 ties.
+- The macro-F1 methodology bug flagged above (footnote said 3-class, number was 4-class) affects
+  every future run added to this table with a healthy-free test split — use the explicit 3-class
+  figure (0.554 / 0.558 here) when a true classification-only macro is wanted, and don't trust the
+  "Macro F1" column's footnotes without checking the underlying JSON.
+
+---
+
+# 2026-09-03 update: corrected 3-tier annotation scheme (runs J, K)
+
+**The annotation scheme changed: `tree_class` is now 3-tier (1=healthy, 2=mild, 3=severe — no
+"moderate"), not the old 4-tier scale.** Investigating this surfaced a real, pre-existing bug that
+had silently affected every `data/new_data` run so far (F, G, H, I):
+
+- `data/annotations/0831_v3/AnnotationRGB.shp` (the shapefile behind every `data/new_data` run)
+  already stores `tree_class ∈ {1, 2, 3}` — 1-indexed, no 0. The *old* shapefile
+  (`data/annotations/NDVI_mean3.shp`, still used by the original `data/dataset_sliced_800`
+  pipeline / runs A–E) stores `tree_class ∈ {0, 1, 2, 3}` — 0-indexed, 4-tier.
+- `scripts/create_masks.py` unconditionally added `+1` to `tree_class` to get the mask class_id
+  (background=0, so class ids must start at 1). That's correct for the 0-indexed shapefile but
+  wrong for the already-1-indexed one: it shifted every new_data tree's class up by one and left
+  class 1 permanently empty.
+- This exactly explains a pattern that showed up in every `data/new_data`-based run documented
+  above: **"zero healthy ground truth"** in every new_data test split (F, G, H, I). It wasn't a
+  real annotation gap — it was this offset bug. What was reported as "mild" for F/G/H/I was
+  actually the annotator's "healthy" tag, "moderate" was actually "mild", and "severe" only ever
+  reached class 4 because `tree_class` topped out at 3.
+- **Fix**: `class_id_offset` is now a config value (`[MASKS] CLASS_ID_OFFSET`, default `1` so the
+  old NDVI_mean3.shp pipeline is unaffected). `data/new_data`'s configs set it to `0`. Also fixed:
+  `create_masks.py` was hardcoded to read `config.ini` regardless of `MASKRCNN_CONFIG` (every other
+  pipeline script respects that env var) — now consistent. `scripts/evaluate_test_set.py`'s
+  `CLASS_NAMES` is now picked by the checkpoint's actual `num_classes` (3-tier vs. 4-tier), so old
+  and new checkpoints both print correct class names instead of the new checkpoint borrowing the
+  old 4-tier labels.
+- **Not fixed here, flagged for follow-up**: `scripts/build_chm_updated_dataset.py` (runs G, H)
+  calls the same masking function with the same un-overridden default offset, reading from the
+  same `AnnotationRGB.shp`. G and H almost certainly have the identical class-shift bug. Rebuilding
+  them was out of scope for this pass — only `data/new_data` (F/I's dataset) was rebuilt.
+- `data/new_data/{train,test}_plot_masks` and `dataset_sliced_800(_test)` were regenerated with the
+  corrected offset. Tile counts are unchanged (416 train/val + 96 test tiles, 742 test GT
+  instances) — only geometry drives tile selection, not class labels, so nothing was dropped or
+  added, only relabeled. **`results/checkpoints_new_data` (run I) and `results/checkpoints_scaled_uint8`
+  (run F) were deliberately left untouched** as the historical record of the pre-fix numbers; the
+  corrected runs below write to new directories instead of overwriting them.
+
+## Configuration
+
+| Run | Checkpoint dir | Channels | Classes | Preprocessing | Dataset | Best epoch / trained |
+|---|---|---|---|---|---|---|
+| J | `results/checkpoints_new_data_native_3class/` | 8 | 4 (bg+3: healthy/mild/severe) | native | `data/new_data/dataset_sliced_800` (rebuilt) | 66 / 96 |
+| K | `results/checkpoints_new_data_scaled_uint8_3class/` | 8 | 4 (bg+3) | scaled_uint8 | same | 15 / 45 |
+
+Configs: [config_new_data_native_3class.ini](config_new_data_native_3class.ini) /
+[config_new_data_scaled_uint8_3class.ini](config_new_data_scaled_uint8_3class.ini). Same anchors,
+architecture and schedule as F/I (`sizes=112,144,184,216,288`, `ratios=0.62,1.0,1.36`,
+`batch_size=2`, `lr=1e-4` cosine, early stopping patience 30, checkpoint selection by highest
+`pooled_f1`). Only `num_classes` (5→4) and the mask class encoding changed; image_mean/std are
+unchanged from J/I's and K's scaled_uint8 predecessors since pixel statistics don't depend on
+class labels. J and K are the direct 3-class counterparts of I and F respectively — same
+comparison, same test plots (`plot_1/16/25/28/31/7`), corrected labels.
+
+## Pooled test-set results — evaluation metrics (`evaluate_test_set.py`, score≥0.5, IoU≥0.5, 96 tiles / 742 GT)
+
+| Run | tp | fp | fn | Precision | Recall | F1 | Macro F1 | AP50 | AR@100 |
+|---|---|---|---|---|---|---|---|---|---|
+| J (native, 3-class) | 391 | 334 | 351 | 0.539 | 0.527 | 0.533 | 0.535 | 0.517 | 0.365 |
+| K (scaled_uint8, 3-class) | 435 | 342 | 307 | 0.560 | 0.586 | **0.573** | 0.576 | 0.626 | 0.497 |
+
+Unlike F/I's macro F1, J/K's Macro F1 here is a genuine 3-class average — `healthy` now has real
+GT (220 instances) so nothing needs excluding or flagging. **K (scaled_uint8) beats J (native) on
+every metric**: F1 0.573 vs 0.533, macro F1 0.576 vs 0.535, AP50 0.626 vs 0.517, AR@100 0.497 vs
+0.365. This is the same direction as the G-vs-H result (scaled_uint8 ahead) and the opposite
+direction from I-vs-F's near-tie — though F/I's numbers are under the old mislabeled scheme, so
+this is really the first clean native-vs-scaled_uint8 read on the corrected 3-class annotations.
+
+### Per-class F1 (pooled)
+
+| Run | healthy | mild | severe |
+|---|---|---|---|
+| J (native) | 0.540 (107/69/113) | 0.501 (144/156/131) | 0.565 (140/109/107) |
+| K (scaled_uint8) | 0.571 (106/45/114) | 0.533 (169/190/106) | 0.623 (160/107/87) |
+
+(tp/fp/fn in parentheses.) K beats J on all three classes, most on `severe` (+0.058) and `healthy`
+(+0.031). Total false positives are similar between the two (342 vs 334), so the gap is mostly
+recall: K finds more `mild` (0.615 vs 0.524) and `severe` (0.648 vs 0.567) trees, and on `healthy`
+specifically has notably fewer false positives (45 vs 69) at a similar recall (0.482 vs 0.486).
+
+### Best F1 across the threshold sweep
+
+| Run | Best threshold | Best F1 (default-threshold F1) |
+|---|---|---|
+| J | 0.30 | 0.540 (0.533) |
+| K | 0.50 | 0.573 (0.573) |
+
+## Detection vs grading breakdown — classification metrics (`evaluate_separated_metrics.py`)
+
+| Level | J Precision | J Recall | J F1 | K Precision | K Recall | K F1 |
+|---|---|---|---|---|---|---|
+| Detection (class-agnostic, found it at all) | 0.836 | 0.817 | 0.826 | 0.820 | 0.858 | **0.839** |
+| Grading (health class, given detected — macro over healthy/mild/severe) | 0.514 | 0.507 | 0.509 | 0.539 | 0.529 | 0.531 |
+| Complete end-to-end (includes missed trees) | 0.539 | 0.527 | 0.533 | 0.560 | 0.586 | 0.573 |
+
+K wins at both levels: detection F1 0.839 vs 0.826 (K trades a bit of precision for more recall —
+tp=637/fp=140/fn=105 vs J's tp=606/fp=119/fn=136) and grading F1 0.531 vs 0.509. Per-class grading
+(on detected trees only): healthy F1 J=0.472/K=0.472 (a dead tie), mild J=0.510/K=0.554, severe
+J=0.543/K=0.565 — K's edge is concentrated in mild/severe, not healthy.
+
+Full outputs: `results/checkpoints_new_data_native_3class/{metrics,separated_metrics}/` and
+`results/checkpoints_new_data_scaled_uint8_3class/{metrics,separated_metrics}/`.
+
+## Takeaways
+
+- **On the corrected 3-class annotations, scaled_uint8 clearly beats native** — the opposite of
+  I-vs-F's near-tie. Since I-vs-F was run under the mislabeled 4-class scheme, K-vs-J supersedes it
+  as the preprocessing-mode comparison to trust for `data/new_data`. Combined with G-vs-H (also
+  scaled_uint8 ahead, on the smaller CHM-update subset), scaled_uint8 now leads in every
+  apples-to-apples comparison run on this project's newer annotations — native only looked
+  competitive under the buggy 4-class labeling.
+- Dropping "moderate" simplified the classification task (3 tiers instead of 4, and a real
+  `healthy` class instead of an always-empty one), so J/K's numbers are **not directly comparable**
+  to F/I's on raw magnitude — different class taxonomy, different denominators. Don't read "J's
+  0.533 vs I's 0.553" as native getting worse; they're scoring different label sets.
+- Grading errors still dominate over detection errors, same pattern as every earlier run: detection
+  F1 is ~0.83, grading F1 is ~0.51-0.53 for both J and K.
+- Next step, if pursued: apply the same `CLASS_ID_OFFSET` fix to the CHM-update pipeline
+  (`build_chm_updated_dataset.py` / configs `config_chm_update_*.ini`) and rebuild/retrain G and H,
+  since they likely carry the identical class-shift bug on the same shapefile.
+
+---
+
+# 2026-09-03 update: new annotation set, full pipeline rerun (runs L, M)
+
+A new, independent annotation set arrived: `data/annotations/new_plots/{Plot_0903,Annotation_0903}.shp`
+— 43 plots (34 train / 9 test, `plot_id`/`class` columns) and 2163 tree polygons. Same site as
+`data/new_data` (plot bounds fall entirely inside the existing `results/stacked_8ch_out_new_data.vrt`,
+so the underlying RGB+CHM+NDVI+CIRE+GNDVI+NDRE imagery was reused unchanged - only the plot
+boundaries and tree annotations are new) and the same 3-tier scheme as the fixed
+`AnnotationRGB.shp` (`tree_class ∈ {1,2,3}`, no 0, no "moderate": 688 healthy / 757 mild / 718
+severe polygons). Ran the full pipeline from `cut_plots.py` onward into distinct `data/new_plots/`
+and `results/checkpoints_new_plots_*` directories so nothing from J/K/F/I/etc. was touched.
+
+## Pipeline steps run
+
+1. `cut_plots.py` (VRT reused, new `Plot_0903.shp`) → `data/new_plots/cropped_plots/{train,test}`:
+   34 + 9 plot GeoTIFFs.
+2. `create_masks.py` (new `Annotation_0903.shp`, `CLASS_ID_OFFSET=0` - same fix as the J/K update)
+   → `data/new_plots/{train,test}_plot_masks`: 1766 train + 413 test tree instances.
+3. `slice_plots.py` → `data/new_plots/dataset_sliced_800(_test)`: 543 train/val tiles, 144 test
+   tiles, 979 test GT instances.
+4. `compute_anchor_sizes.py --masks_dir data/new_plots/train_plot_masks`: crown side-length
+   p50=178px / p99=407px - nearly identical to `data/new_data`'s p50=181px / p99=403px (same
+   imagery/site), so **F/I/J/K's anchors were reused** (`112,144,184,216,288` /
+   `0.62,1.0,1.36`) rather than the script's freshly-computed stride-respecting pyramid, per the
+   documented ablation in this file's earlier section (`Don't reinstate it...`).
+5. `compute_channel_stats.py --dataset_dir data/new_plots/dataset_sliced_800` (431 training tiles,
+   post nodata-sentinel fix) for the native-mode config's `image_mean`/`image_std`.
+6. Trained native then scaled_uint8 (same architecture/schedule as every other run: ResNet-50-FPN
+   `trainable_layers=3`, `batch_size=2`, `lr=1e-4` cosine, warmup 10, early stopping patience 30,
+   checkpoint selection by highest `pooled_f1`).
+
+## Bug found while evaluating: GPU memory leak in `evaluate_separated_metrics.py`
+
+Scoring the scaled_uint8 checkpoint crashed with `CUDA out of memory` (10.6 GiB used by a single
+eval process on an 11.5 GiB card) - the native checkpoint's evaluation had just run fine on the
+same 144 tiles. Cause: the per-batch loop accumulated `model()`'s raw output dicts (boxes, labels,
+scores, **and full-resolution instance masks**) into `all_predictions` without moving them off the
+GPU first; `torch.cuda.empty_cache()` right after (present, but only returns *unreferenced* cached
+memory to the driver - it does nothing while a live Python list still holds the tensors) couldn't
+help. The noisier scaled_uint8 checkpoint produced enough more raw per-tile detections before score
+thresholding that accumulated mask memory crossed the card's limit; the cleaner native checkpoint
+happened to stay under it. Fixed in `scripts/evaluate_separated_metrics.py` by moving each
+prediction/target dict to CPU (`{k: v.cpu() for k, v in p.items()}`) before appending - a general
+fix, not specific to this run.
+
+## Configuration
+
+| Run | Checkpoint dir | Channels | Classes | Preprocessing | Dataset | Best epoch / trained |
+|---|---|---|---|---|---|---|
+| L | `results/checkpoints_new_plots_native/` | 8 | 4 (bg+3: healthy/mild/severe) | native | `data/new_plots/dataset_sliced_800` | 73 / 100 |
+| M | `results/checkpoints_new_plots_scaled_uint8/` | 8 | 4 (bg+3) | scaled_uint8 | same | 20 / 50 |
+
+Configs: [config_new_plots_native.ini](config_new_plots_native.ini) /
+[config_new_plots_scaled_uint8.ini](config_new_plots_scaled_uint8.ini). L's `image_mean`/`image_std`
+for the extra 5 bands: `11.3114,0.3846,0.2376,0.3712,0.1012` / `8.5418,0.2560,0.1636,0.2379,0.0680`
+(CHM/NDVI/CIRE/GNDVI/NDRE); M uses the same 0.5/0.5 placeholder convention as every other
+scaled_uint8 run. **This is the largest training set used in this project so far** (34 plots vs.
+F/I/J/K's 26, G/H's 11) - both L and M trained noticeably longer before early-stopping than J/K did.
+
+## Pooled test-set results — evaluation metrics (`evaluate_test_set.py`, score≥0.5, IoU≥0.5, 144 tiles / 979 GT)
+
+| Run | tp | fp | fn | Precision | Recall | F1 | Macro F1 | AP50 | AR@100 |
+|---|---|---|---|---|---|---|---|---|---|
+| L (native) | 619 | 432 | 360 | 0.589 | 0.632 | **0.610** | 0.614 | 0.563 | 0.401 |
+| M (scaled_uint8) | 683 | 727 | 296 | 0.484 | 0.698 | 0.572 | 0.574 | 0.688 | 0.499 |
+
+**L (native) wins on complete-task F1** (0.610 vs. 0.572) - the opposite of J-vs-K's result on
+`data/new_data`, where scaled_uint8 won. M trades a lot of precision for recall (P 0.484 vs. L's
+0.589, R 0.698 vs. L's 0.632) and has much higher AP50/AR@100 (0.688/0.499 vs. 0.563/0.401) -
+M's raw detector is more sensitive, but at the default 0.5 threshold that sensitivity shows up
+mostly as false positives (727 vs. L's 432) rather than net F1 gain. **Both L and M score
+noticeably higher than every prior `data/new_data`-based run** (J/K's 0.533/0.573, F/I's 0.553) -
+consistent with this being the largest, most plot-diverse training set used so far.
+
+### Per-class F1 (pooled)
+
+| Run | healthy | mild | severe |
+|---|---|---|---|
+| L (native) | 0.633 (202/133/101) | 0.566 (224/200/144) | 0.643 (193/99/115) |
+| M (scaled_uint8) | 0.560 (245/327/58) | 0.528 (211/220/157) | 0.635 (227/180/81) |
+
+(tp/fp/fn in parentheses.) L beats M on all three classes, most on `healthy` (+0.073) where M's
+false-positive count (327, more than its 245 true positives) sinks precision to 0.428 despite a
+strong 0.809 recall. `severe` is the closest class between the two (0.643 vs. 0.635).
+
+### Best F1 across the threshold sweep
+
+| Run | Best threshold | Best F1 (default-threshold F1) |
+|---|---|---|
+| L | 0.50 | 0.610 (0.610) |
+| M | 0.70 | 0.603 (0.572) |
+
+Even at M's best operating threshold (0.70, trading most of its recall advantage back for
+precision), it still falls short of L's F1 - native wins this comparison at every threshold M was
+evaluated at.
+
+## Detection vs grading breakdown — classification metrics (`evaluate_separated_metrics.py`)
+
+| Level | L Precision | L Recall | L F1 | M Precision | M Recall | M F1 |
+|---|---|---|---|---|---|---|
+| Detection (class-agnostic, found it at all) | 0.849 | 0.911 | **0.879** | 0.671 | 0.966 | 0.792 |
+| Grading (health class, given detected — macro over healthy/mild/severe) | 0.535 | 0.533 | 0.531 | 0.428 | 0.430 | 0.413 |
+| Complete end-to-end (includes missed trees) | 0.589 | 0.632 | 0.610 | 0.484 | 0.698 | 0.572 |
+
+**L's detection F1 (0.879) is the highest of any run in this project so far** (previous best: F/K
+around 0.81-0.84), and it leads at every level, not just one. M's detection recall is exceptional
+(0.966 - only 33 of 979 GT trees missed entirely) but comes at the cost of detection precision
+(0.671, i.e. a lot of spurious boxes) and grading (0.413 vs. L's 0.531) - the false positives (464
+of them at the detection level) actively hurt end-to-end quality rather than being a free lunch of
+extra recall. Grading errors still dominate over detection errors for both, same pattern as every
+earlier run, but the gap between the two levels is smaller here than in J/K, since detection itself
+improved so much with the larger training set.
+
+Full outputs: `results/checkpoints_new_plots_native/{metrics,separated_metrics}/` and
+`results/checkpoints_new_plots_scaled_uint8/{metrics,separated_metrics}/`.
+
+## Takeaways
+
+- **More, more-diverse training plots (34 here vs. 26 for F/I/J/K, 11 for G/H) is the strongest
+  lever pulled so far in this project** - L's detection F1 (0.879) and complete-task F1 (0.610)
+  both beat every earlier run outright, well past the gap any preprocessing-mode change has
+  produced. This lines up with the CLAUDE.md/earlier-takeaways pattern that detection specifically
+  benefits from plot/background diversity.
+- **Native beats scaled_uint8 here, reversing J/K's result** (where scaled_uint8 won on
+  `data/new_data`). Combined, this project now has three native-vs-scaled_uint8 comparisons under
+  the corrected 3-class scheme (G/H, J/K, L/M) and they don't agree on a consistent winner - the
+  preprocessing-mode question looks dataset-dependent rather than having a universal answer, at
+  least at the current per-run training-set sizes. Don't generalize a preprocessing recommendation
+  from any single comparison in this file.
+- M's very high detection recall (0.966) alongside its worse end-to-end numbers is a useful
+  diagnostic: raw detection sensitivity is not the same as being a better model once a fixed score
+  threshold and health-class grading are applied. If the project ever wants a "never miss a tree"
+  operating point, M (or L swept to a low threshold) is the one to revisit - but scaled_uint8's
+  default-threshold precision here needs correcting first.
+- Grading F1 (~0.53 for L, ~0.41 for M) is still the dominant source of end-to-end error for both,
+  same as every run measured this way in this file.

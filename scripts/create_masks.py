@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO, filename = "utils.log" ,format='%(asctim
 logger = logging.getLogger("Create_Masks")
 
 config = configparser.ConfigParser()
-config_path = "config.ini"
+config_path = os.environ.get("MASKRCNN_CONFIG", "config.ini")
 config.read(config_path)
 
 
@@ -89,7 +89,7 @@ LABEL_DIVISOR = 10000
 
 
 def generate_instance_class_mask_geotiff(plot_tif_path, trees_gdf, output_mask_dir, class_property="tree_class",
-                                         min_tree_height=None, chm_band=4):
+                                         min_tree_height=None, chm_band=4, class_id_offset=1):
     """
     Generates a mask GeoTIFF where every tree is its own instance AND carries its
     health class, encoded as `class_id * LABEL_DIVISOR + instance_index`.
@@ -104,6 +104,16 @@ def generate_instance_class_mask_geotiff(plot_tif_path, trees_gdf, output_mask_d
         surveyed stands here are mature - median height ~21 m - so a 2 m cut only
         removes a handful of annotations with near-zero or negative CHM, i.e.
         ground-level noise rather than real trees.
+
+    class_id_offset: added to the raw `class_property` value to get the mask
+        class_id (background is always 0, so class_id must start at 1). Two
+        annotation schemes coexist in this project: mesh.shp/NDVI_mean3.shp's
+        tree_class is 0-indexed (0-3, healthy..severe) and needs offset=1;
+        0831_v3/AnnotationRGB.shp's tree_class is already 1-indexed (1-3,
+        healthy/mild/severe, no "moderate" tier) and needs offset=0. Passing the
+        wrong offset silently shifts every class by one and leaves class 1
+        permanently empty rather than raising an error - set via config.ini's
+        [MASKS] CLASS_ID_OFFSET, not guessed from the data.
     """
     os.makedirs(output_mask_dir, exist_ok=True)
     plot_filename = os.path.basename(plot_tif_path)
@@ -139,7 +149,7 @@ def generate_instance_class_mask_geotiff(plot_tif_path, trees_gdf, output_mask_d
                 continue
 
             try:
-                class_id = int(row.get(class_property, 0)) + 1
+                class_id = int(row.get(class_property, 0)) + class_id_offset
             except (ValueError, TypeError):
                 logger.warning(f"Invalid class value for a tree in {base_id}, skipping it")
                 continue
@@ -301,6 +311,7 @@ if __name__ == "__main__":
     TREES_SHAPEFILE = config.get('MASKS', 'TREE_SHAPEFILE', fallback='data/Annotations/NDVI_mean3.shp')
     MASKS_OUTPUT_DIR = config.get('MASKS', 'OUTPUT_DIR', fallback='data/masks')
     TREE_CLASS_PROPERTY = config.get('MASKS', 'TREE_CLASS_PROPERTY', fallback='tree_class')
+    CLASS_ID_OFFSET = int(config.get('MASKS', 'CLASS_ID_OFFSET', fallback='1'))
     _min_height = config.get('MASKS', 'MIN_TREE_HEIGHT', fallback='').strip()
     MIN_TREE_HEIGHT = float(_min_height) if _min_height else None
     CHM_BAND = int(config.get('MASKS', 'CHM_BAND', fallback='4'))
@@ -308,7 +319,7 @@ if __name__ == "__main__":
         logger.info(f"Height filter: dropping trees below {MIN_TREE_HEIGHT} m (CHM band {CHM_BAND})")
 
     logger.info(f"Starting mask generation for plots in {PLOTS_DIR} using tree annotations from {TREES_SHAPEFILE}...")
-    logger.info(f"Using tree class property: '{TREE_CLASS_PROPERTY}'")
+    logger.info(f"Using tree class property: '{TREE_CLASS_PROPERTY}' with class_id_offset={CLASS_ID_OFFSET}")
 
     if not os.path.exists(MASKS_OUTPUT_DIR):
         os.makedirs(MASKS_OUTPUT_DIR, exist_ok=True)
@@ -353,7 +364,8 @@ if __name__ == "__main__":
             try:
                 n_inst, n_dropped = generate_instance_class_mask_geotiff(
                     plot_path, trees_gdf, masks_dir, class_property=TREE_CLASS_PROPERTY,
-                    min_tree_height=MIN_TREE_HEIGHT, chm_band=CHM_BAND
+                    min_tree_height=MIN_TREE_HEIGHT, chm_band=CHM_BAND,
+                    class_id_offset=CLASS_ID_OFFSET
                 )
                 total_instances += n_inst
                 total_dropped += n_dropped
